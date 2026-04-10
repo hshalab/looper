@@ -138,6 +138,60 @@ describe("SqliteStore", () => {
       payloadJson: '{"status":"idle"}',
       createdAt: now,
     });
+    store.queue.upsert({
+      id: "queue_reviewer_1",
+      projectId: "project_1",
+      loopId: "loop_1",
+      taskId: null,
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      dedupeKey: "reviewer:acme/looper:42",
+      priority: 1,
+      status: "queued",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: null,
+      claimedAt: null,
+      startedAt: null,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:42",
+      payloadJson: '{"source":"discover"}',
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.queue.upsert({
+      id: "queue_fixer_1",
+      projectId: "project_1",
+      loopId: null,
+      taskId: null,
+      type: "fixer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      dedupeKey: "fixer:acme/looper:42",
+      priority: 2,
+      status: "queued",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: null,
+      claimedAt: null,
+      startedAt: null,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:42",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
 
     expect(
       store.locks.acquire({
@@ -241,6 +295,20 @@ describe("SqliteStore", () => {
       "reviewer_1",
     );
     expect(store.locks.get("pr:acme/looper:42")?.owner).toBe("reviewer-loop");
+    expect(store.queue.findActiveByDedupe("reviewer:acme/looper:42")?.id).toBe(
+      "queue_reviewer_1",
+    );
+    expect(store.queue.listScheduled(now).map((item) => item.id)).toEqual([
+      "queue_reviewer_1",
+    ]);
+    expect(store.queue.claimNext(now, "executor_1")?.id).toBe(
+      "queue_reviewer_1",
+    );
+    expect(store.queue.getById("queue_reviewer_1")?.status).toBe("running");
+    store.queue.complete("queue_reviewer_1", now);
+    expect(store.queue.listScheduled(now).map((item) => item.id)).toEqual([
+      "queue_fixer_1",
+    ]);
     expect(store.agentExecutions.listActive()).toHaveLength(1);
     expect(store.agentExecutions.getById("agent_exec_1")?.pid).toBe(12345);
     expect(store.notifications.list(1)[0]?.channel).toBe("in_app");
@@ -256,7 +324,7 @@ describe("SqliteStore", () => {
 
     const health = store.schema.healthcheck();
     expect(health.ok).toBe(true);
-    expect(health.migration.latestAppliedId).toBe("0002_integrations");
+    expect(health.migration.latestAppliedId).toBe("0003_scheduler_queue");
     expect(health.lastUpdatedAt).toBeString();
 
     const backupPath = store.schema.backup();
@@ -348,6 +416,114 @@ describe("SqliteStore", () => {
       }),
     ).toBe(true);
     expect(store.locks.get("task:123")?.owner).toBe("worker-b");
+
+    store.close();
+  });
+
+  test("filters scheduled items when loops are paused and supports retry markers", async () => {
+    const fixture = await createStoreFixture();
+    const store = new SqliteStore({ dbPath: fixture.dbPath });
+    store.initialize({ autoMigrate: true });
+
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: "/tmp/looper",
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.loops.upsert({
+      id: "loop_paused",
+      projectId: "project_1",
+      type: "worker",
+      targetType: "task",
+      targetId: "task_1",
+      repo: null,
+      prNumber: null,
+      status: "paused",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.tasks.upsert({
+      id: "task_1",
+      projectId: "project_1",
+      title: "Queued task",
+      description: null,
+      status: "ready",
+      loopId: "loop_paused",
+      repo: null,
+      prNumber: null,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.queue.upsert({
+      id: "queue_worker_1",
+      projectId: "project_1",
+      loopId: "loop_paused",
+      taskId: "task_1",
+      type: "worker",
+      targetType: "task",
+      targetId: "task_1",
+      repo: null,
+      prNumber: null,
+      dedupeKey: "worker:task_1",
+      priority: 3,
+      status: "queued",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: null,
+      claimedAt: null,
+      startedAt: null,
+      finishedAt: null,
+      lockKey: "task:task_1",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(store.queue.listScheduled(now)).toHaveLength(0);
+
+    const pausedLoop = store.loops.getById("loop_paused");
+    if (!pausedLoop) {
+      throw new Error("expected paused loop to exist");
+    }
+
+    store.loops.upsert({
+      ...pausedLoop,
+      status: "queued",
+      updatedAt: "2026-04-11T12:00:01.000Z",
+    });
+
+    expect(store.queue.listScheduled(now).map((item) => item.id)).toEqual([
+      "queue_worker_1",
+    ]);
+
+    store.queue.markRetry({
+      id: "queue_worker_1",
+      availableAt: "2026-04-11T12:00:30.000Z",
+      attempts: 1,
+      errorKind: "retryable_after_resume",
+      errorMessage: "resume later",
+      updatedAt: "2026-04-11T12:00:05.000Z",
+    });
+    expect(store.queue.getById("queue_worker_1")).toMatchObject({
+      status: "queued",
+      attempts: 1,
+      availableAt: "2026-04-11T12:00:30.000Z",
+      lastErrorKind: "retryable_after_resume",
+    });
 
     store.close();
   });

@@ -4,6 +4,8 @@ import type {
   LockRecord,
   LoopRecord,
   NotificationRecord,
+  QueueFailureKind,
+  QueueItemRecord,
   MigrationStatus,
   ProjectRecord,
   PullRequestSnapshotRecord,
@@ -65,6 +67,33 @@ export interface Store {
     release(key: string): void;
     get(key: string): LockRecord | null;
     listExpired(nowIso: string): LockRecord[];
+  };
+
+  queue: {
+    upsert(record: QueueItemRecord): void;
+    getById(id: string): QueueItemRecord | null;
+    list(): QueueItemRecord[];
+    findActiveByDedupe(dedupeKey: string): QueueItemRecord | null;
+    listScheduled(nowIso: string, limit?: number): QueueItemRecord[];
+    claimNext(nowIso: string, claimedBy: string): QueueItemRecord | null;
+    complete(id: string, finishedAt: string): void;
+    markRetry(input: {
+      id: string;
+      availableAt: string;
+      attempts: number;
+      errorMessage?: string | null;
+      errorKind: QueueFailureKind;
+      updatedAt: string;
+    }): void;
+    fail(input: {
+      id: string;
+      finishedAt: string;
+      errorMessage?: string | null;
+      errorKind: QueueFailureKind;
+      updatedAt: string;
+    }): void;
+    cancelByLoop(loopId: string, finishedAt: string, reason?: string): number;
+    cancelByTask(taskId: string, finishedAt: string, reason?: string): number;
   };
 
   agentExecutions: {

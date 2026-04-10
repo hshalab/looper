@@ -166,6 +166,48 @@ export interface LockRecord {
   updatedAt: string;
 }
 
+export type QueueItemStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "manual_intervention";
+
+export type QueueFailureKind =
+  | "retryable_transient"
+  | "retryable_after_resume"
+  | "non_retryable"
+  | "manual_intervention";
+
+export interface QueueItemRecord {
+  id: string;
+  projectId?: string | null;
+  loopId?: string | null;
+  taskId?: string | null;
+  type: string;
+  targetType: string;
+  targetId: string;
+  repo?: string | null;
+  prNumber?: number | null;
+  dedupeKey: string;
+  priority: number;
+  status: QueueItemStatus;
+  availableAt: string;
+  attempts: number;
+  maxAttempts: number;
+  claimedBy?: string | null;
+  claimedAt?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  lockKey?: string | null;
+  payloadJson?: string | null;
+  lastError?: string | null;
+  lastErrorKind?: QueueFailureKind | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface AgentExecutionRecord {
   id: string;
   projectId?: string | null;

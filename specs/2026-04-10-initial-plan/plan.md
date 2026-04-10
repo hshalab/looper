@@ -136,16 +136,16 @@
 
 ## 9. Scheduler / Queue 基础
 
-- [ ] 实现轮询式 scheduler
-- [ ] 实现 queue item 数据结构
-- [ ] 实现 enqueue
-- [ ] 实现 dequeue
-- [ ] 实现 scheduled item 查询
-- [ ] 实现 attempt 计数与指数退避
-- [ ] 实现 retryable / non-retryable / manual_intervention 分类
-- [ ] 实现业务锁获取与释放
-- [ ] 实现 reviewer 优先于 fixer 的 PR 抢占规则
-- [ ] 实现 pause / cancel 对调度层的影响
+- [x] 实现轮询式 scheduler
+- [x] 实现 queue item 数据结构
+- [x] 实现 enqueue
+- [x] 实现 dequeue
+- [x] 实现 scheduled item 查询
+- [x] 实现 attempt 计数与指数退避
+- [x] 实现 retryable / non-retryable / manual_intervention 分类
+- [x] 实现业务锁获取与释放
+- [x] 实现 reviewer 优先于 fixer 的 PR 抢占规则
+- [x] 实现 pause / cancel 对调度层的影响
 
 ## 10. Reviewer Loop（先打通第一条链路）
 

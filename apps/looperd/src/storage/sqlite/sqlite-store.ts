@@ -7,6 +7,8 @@ import type {
   NotificationRecord,
   ProjectRecord,
   PullRequestSnapshotRecord,
+  QueueFailureKind,
+  QueueItemRecord,
   RunRecord,
   TaskItemRecord,
   TaskRecord,
@@ -422,6 +424,245 @@ export class SqliteStore implements Store {
     },
   };
 
+  public readonly queue = {
+    upsert: (record: QueueItemRecord): void => {
+      this.coordinator.db
+        .query(`
+          INSERT INTO queue_items (
+            id, project_id, loop_id, task_id, type, target_type, target_id,
+            repo, pr_number, dedupe_key, priority, status, available_at,
+            attempts, max_attempts, claimed_by, claimed_at, started_at,
+            finished_at, lock_key, payload_json, last_error, last_error_kind,
+            created_at, updated_at
+          )
+          VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18,
+            ?19, ?20, ?21, ?22, ?23,
+            ?24, ?25
+          )
+          ON CONFLICT(id) DO UPDATE SET
+            project_id=excluded.project_id,
+            loop_id=excluded.loop_id,
+            task_id=excluded.task_id,
+            type=excluded.type,
+            target_type=excluded.target_type,
+            target_id=excluded.target_id,
+            repo=excluded.repo,
+            pr_number=excluded.pr_number,
+            dedupe_key=excluded.dedupe_key,
+            priority=excluded.priority,
+            status=excluded.status,
+            available_at=excluded.available_at,
+            attempts=excluded.attempts,
+            max_attempts=excluded.max_attempts,
+            claimed_by=excluded.claimed_by,
+            claimed_at=excluded.claimed_at,
+            started_at=excluded.started_at,
+            finished_at=excluded.finished_at,
+            lock_key=excluded.lock_key,
+            payload_json=excluded.payload_json,
+            last_error=excluded.last_error,
+            last_error_kind=excluded.last_error_kind,
+            updated_at=excluded.updated_at
+        `)
+        .run(
+          record.id,
+          record.projectId ?? null,
+          record.loopId ?? null,
+          record.taskId ?? null,
+          record.type,
+          record.targetType,
+          record.targetId,
+          record.repo ?? null,
+          record.prNumber ?? null,
+          record.dedupeKey,
+          record.priority,
+          record.status,
+          record.availableAt,
+          record.attempts,
+          record.maxAttempts,
+          record.claimedBy ?? null,
+          record.claimedAt ?? null,
+          record.startedAt ?? null,
+          record.finishedAt ?? null,
+          record.lockKey ?? null,
+          record.payloadJson ?? null,
+          record.lastError ?? null,
+          record.lastErrorKind ?? null,
+          record.createdAt,
+          record.updatedAt,
+        );
+    },
+    getById: (id: string): QueueItemRecord | null => {
+      const row = this.coordinator.db
+        .query("SELECT * FROM queue_items WHERE id = ?1")
+        .get(id) as Record<string, unknown> | null;
+      return row ? mapQueueItem(row) : null;
+    },
+    list: (): QueueItemRecord[] => {
+      return this.coordinator.db
+        .query("SELECT * FROM queue_items ORDER BY created_at DESC")
+        .all()
+        .map((row) => mapQueueItem(row as Record<string, unknown>));
+    },
+    findActiveByDedupe: (dedupeKey: string): QueueItemRecord | null => {
+      const row = this.coordinator.db
+        .query(
+          `SELECT * FROM queue_items
+           WHERE dedupe_key = ?1 AND status IN ('queued', 'running')
+           ORDER BY created_at DESC
+           LIMIT 1`,
+        )
+        .get(dedupeKey) as Record<string, unknown> | null;
+      return row ? mapQueueItem(row) : null;
+    },
+    listScheduled: (nowIso: string, limit = 100): QueueItemRecord[] => {
+      return this.coordinator.db
+        .query(`${SCHEDULED_QUEUE_QUERY} LIMIT ?2`)
+        .all(nowIso, limit)
+        .map((row) => mapQueueItem(row as Record<string, unknown>));
+    },
+    claimNext: (nowIso: string, claimedBy: string): QueueItemRecord | null => {
+      return this.coordinator.withTransaction(() => {
+        const row = this.coordinator.db
+          .query(`${SCHEDULED_QUEUE_QUERY} LIMIT 1`)
+          .get(nowIso) as Record<string, unknown> | null;
+
+        if (!row) {
+          return null;
+        }
+
+        const result = this.coordinator.db
+          .query(
+            `UPDATE queue_items
+             SET status = 'running',
+                 claimed_by = ?2,
+                 claimed_at = ?3,
+                 started_at = COALESCE(started_at, ?3),
+                 updated_at = ?3
+             WHERE id = ?1 AND status = 'queued'`,
+          )
+          .run(String(row.id), claimedBy, nowIso);
+
+        if (result.changes === 0) {
+          return null;
+        }
+
+        const claimed = this.coordinator.db
+          .query("SELECT * FROM queue_items WHERE id = ?1")
+          .get(String(row.id)) as Record<string, unknown> | null;
+        return claimed ? mapQueueItem(claimed) : null;
+      });
+    },
+    complete: (id: string, finishedAt: string): void => {
+      this.coordinator.db
+        .query(
+          `UPDATE queue_items
+           SET status = 'completed', finished_at = ?2, updated_at = ?2
+           WHERE id = ?1`,
+        )
+        .run(id, finishedAt);
+    },
+    markRetry: (input: {
+      id: string;
+      availableAt: string;
+      attempts: number;
+      errorMessage?: string | null;
+      errorKind: QueueFailureKind;
+      updatedAt: string;
+    }): void => {
+      this.coordinator.db
+        .query(
+          `UPDATE queue_items
+           SET status = 'queued',
+               available_at = ?2,
+               attempts = ?3,
+               last_error = ?4,
+               last_error_kind = ?5,
+               claimed_by = NULL,
+               claimed_at = NULL,
+               finished_at = NULL,
+               updated_at = ?6
+           WHERE id = ?1`,
+        )
+        .run(
+          input.id,
+          input.availableAt,
+          input.attempts,
+          input.errorMessage ?? null,
+          input.errorKind,
+          input.updatedAt,
+        );
+    },
+    fail: (input: {
+      id: string;
+      finishedAt: string;
+      errorMessage?: string | null;
+      errorKind: QueueFailureKind;
+      updatedAt: string;
+    }): void => {
+      const terminalStatus =
+        input.errorKind === "manual_intervention"
+          ? "manual_intervention"
+          : "failed";
+
+      this.coordinator.db
+        .query(
+          `UPDATE queue_items
+           SET status = ?2,
+               finished_at = ?3,
+               last_error = ?4,
+               last_error_kind = ?5,
+               updated_at = ?6
+           WHERE id = ?1`,
+        )
+        .run(
+          input.id,
+          terminalStatus,
+          input.finishedAt,
+          input.errorMessage ?? null,
+          input.errorKind,
+          input.updatedAt,
+        );
+    },
+    cancelByLoop: (
+      loopId: string,
+      finishedAt: string,
+      reason?: string,
+    ): number => {
+      const result = this.coordinator.db
+        .query(
+          `UPDATE queue_items
+           SET status = 'cancelled',
+               finished_at = ?2,
+               last_error = COALESCE(?3, last_error),
+               updated_at = ?2
+           WHERE loop_id = ?1 AND status IN ('queued', 'running')`,
+        )
+        .run(loopId, finishedAt, reason ?? null);
+      return result.changes;
+    },
+    cancelByTask: (
+      taskId: string,
+      finishedAt: string,
+      reason?: string,
+    ): number => {
+      const result = this.coordinator.db
+        .query(
+          `UPDATE queue_items
+           SET status = 'cancelled',
+               finished_at = ?2,
+               last_error = COALESCE(?3, last_error),
+               updated_at = ?2
+           WHERE task_id = ?1 AND status IN ('queued', 'running')`,
+        )
+        .run(taskId, finishedAt, reason ?? null);
+      return result.changes;
+    },
+  };
+
   public readonly agentExecutions = {
     upsert: (record: AgentExecutionRecord): void => {
       this.coordinator.db
@@ -766,6 +1007,38 @@ function mapLock(row: Record<string, unknown>): LockRecord {
   };
 }
 
+function mapQueueItem(row: Record<string, unknown>): QueueItemRecord {
+  return {
+    id: String(row.id),
+    projectId: asNullableString(row.project_id),
+    loopId: asNullableString(row.loop_id),
+    taskId: asNullableString(row.task_id),
+    type: String(row.type),
+    targetType: String(row.target_type),
+    targetId: String(row.target_id),
+    repo: asNullableString(row.repo),
+    prNumber: asNullableNumber(row.pr_number),
+    dedupeKey: String(row.dedupe_key),
+    priority: Number(row.priority),
+    status: String(row.status) as QueueItemRecord["status"],
+    availableAt: String(row.available_at),
+    attempts: Number(row.attempts),
+    maxAttempts: Number(row.max_attempts),
+    claimedBy: asNullableString(row.claimed_by),
+    claimedAt: asNullableString(row.claimed_at),
+    startedAt: asNullableString(row.started_at),
+    finishedAt: asNullableString(row.finished_at),
+    lockKey: asNullableString(row.lock_key),
+    payloadJson: asNullableString(row.payload_json),
+    lastError: asNullableString(row.last_error),
+    lastErrorKind: asNullableString(
+      row.last_error_kind,
+    ) as QueueFailureKind | null,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
 function mapAgentExecution(row: Record<string, unknown>): AgentExecutionRecord {
   return {
     id: String(row.id),
@@ -853,3 +1126,29 @@ function asNullableNumber(value: unknown): number | null {
 function asBoolean(value: unknown): boolean {
   return value === 1 || value === true || value === "1";
 }
+
+const SCHEDULED_QUEUE_QUERY = `
+  SELECT qi.*
+  FROM queue_items qi
+  LEFT JOIN loops l ON l.id = qi.loop_id
+  LEFT JOIN tasks t ON t.id = qi.task_id
+  WHERE qi.status = 'queued'
+    AND qi.available_at <= ?1
+    AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted')
+    AND COALESCE(t.status, 'ready') NOT IN ('paused', 'completed', 'failed')
+    AND (
+      qi.type != 'fixer'
+      OR qi.repo IS NULL
+      OR qi.pr_number IS NULL
+      OR NOT EXISTS (
+        SELECT 1
+        FROM queue_items blocker
+        WHERE blocker.type = 'reviewer'
+          AND blocker.repo = qi.repo
+          AND blocker.pr_number = qi.pr_number
+          AND blocker.status IN ('queued', 'running')
+          AND blocker.id != qi.id
+      )
+    )
+  ORDER BY qi.priority ASC, qi.available_at ASC, qi.created_at ASC
+`;
