@@ -1,0 +1,4 @@
+.ralph/**
+apps/**/dist/**
+node_modules/**
+bun.lock

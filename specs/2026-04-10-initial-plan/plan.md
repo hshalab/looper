@@ -2,11 +2,11 @@
 
 ## 1. 仓库与应用骨架
 
-- [ ] 创建 `apps/looperd/src/` 目录骨架（`bootstrap/`、`server/`、`app/`、`domain/`、`infra/`、`storage/`、`runtime/`）
-- [ ] 创建 `apps/cli/` 基础骨架
-- [ ] 预留 `apps/web/` 目录但不实现 MVP UI
-- [ ] 配置 Bun + TypeScript 基础运行与构建脚本
-- [ ] 配置 monorepo 根级脚本（dev、typecheck、test、lint）
+- [x] 创建 `apps/looperd/src/` 目录骨架（`bootstrap/`、`server/`、`app/`、`domain/`、`infra/`、`storage/`、`runtime/`）
+- [x] 创建 `apps/cli/` 基础骨架
+- [x] 预留 `apps/web/` 目录但不实现 MVP UI
+- [x] 配置 Bun + TypeScript 基础运行与构建脚本
+- [x] 配置 monorepo 根级脚本（dev、typecheck、test、lint）
 
 ## 2. 配置与启动
 

@@ -1,0 +1,10 @@
+{
+  "name": "@looper/web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target browser",
+    "typecheck": "bun x tsc -p tsconfig.json --noEmit"
+  }
+}

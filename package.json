@@ -1,0 +1,19 @@
+{
+  "name": "looper",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.2.10",
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "bun run --cwd apps/looperd dev",
+    "build": "bun run --cwd apps/looperd build && bun run --cwd apps/cli build && bun run --cwd apps/web build",
+    "typecheck": "bun x tsc -b",
+    "test": "bun test",
+    "lint": "bun x @biomejs/biome check ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "bun-types": "^1.2.10",
+    "typescript": "^5.8.3"
+  }
+}

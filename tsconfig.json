@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./apps/looperd" },
+    { "path": "./apps/cli" },
+    { "path": "./apps/web" }
+  ]
+}
