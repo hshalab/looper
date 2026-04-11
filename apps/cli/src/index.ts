@@ -2,13 +2,13 @@
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import {
-  CliApiError,
-  createApiClient,
   type ApiClient,
+  CliApiError,
   type FetchLike,
+  createApiClient,
 } from "./client";
 import { printJson, printSection, printTable } from "./format";
 
@@ -125,6 +125,11 @@ async function dispatch(context: CliContext): Promise<void> {
   switch (command) {
     case "status":
       return runStatus(context);
+    case "project":
+      if (subcommand === "add") {
+        return runProjectAdd(context);
+      }
+      break;
     case "config":
       if (subcommand !== "show") {
         throw new Error("Usage: looper config show [--json]");
@@ -186,7 +191,9 @@ async function dispatch(context: CliContext): Promise<void> {
       break;
   }
 
-  throw new Error("Usage: looper <status|config|daemon|loop|task|pr|run> ...");
+  throw new Error(
+    "Usage: looper <status|project|config|daemon|loop|task|pr|run> ...",
+  );
 }
 
 async function runStatus(context: CliContext) {
@@ -254,6 +261,53 @@ async function runConfigShow(context: CliContext) {
   const data =
     await context.client.get<Record<string, unknown>>("/api/v1/config");
   printJson(context.write, data);
+}
+
+async function runProjectAdd(context: CliContext) {
+  const repoPathArg =
+    context.args.positionals[2] ?? getFlag(context.args, "repo-path");
+  if (!repoPathArg) {
+    throw new Error("Usage: looper project add <repo-path>");
+  }
+
+  const repoPath = resolve(repoPathArg);
+  const id = getFlag(context.args, "id") ?? deriveProjectId(repoPath);
+  const name = getFlag(context.args, "name") ?? id;
+  const data = await context.client.post<Record<string, unknown>>(
+    "/api/v1/projects",
+    {
+      id,
+      name,
+      repoPath,
+      baseBranch: getFlag(context.args, "base-branch"),
+      worktreeRoot: getFlag(context.args, "worktree-root"),
+      repo: getFlag(context.args, "repo"),
+    },
+  );
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, data);
+  }
+
+  printSection(context.write, "Project added", [
+    ["id", data.id as string],
+    ["name", data.name as string],
+    ["repoPath", data.repoPath as string],
+    ["baseBranch", (data.baseBranch as string | null | undefined) ?? "-"],
+    ["repo", (data.repo as string | null | undefined) ?? "-"],
+    ["discoveredPullRequests", data.discoveredPullRequests as number],
+    ["discoveredWorktrees", data.discoveredWorktrees as number],
+  ]);
+
+  const warnings = (data.warnings as string[] | undefined) ?? [];
+  if (warnings.length > 0) {
+    context.write("");
+    printSection(
+      context.write,
+      "Warnings",
+      warnings.map((warning, index) => [String(index + 1), warning]),
+    );
+  }
 }
 
 async function runDaemonStatus(context: CliContext) {
@@ -739,6 +793,15 @@ function parsePullRequestRef(value: string): PullRequestRef {
 
 function parseOptionalPullRequestRef(value: string | undefined) {
   return value ? parsePullRequestRef(value) : undefined;
+}
+
+function deriveProjectId(repoPath: string): string {
+  const normalized = basename(repoPath)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalized || "project";
 }
 
 async function loadCliConfig(options: {

@@ -3,9 +3,15 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { LooperConfig } from "../config/index";
 import type { Logger } from "../bootstrap/logger";
-import { NotificationGateway } from "../infra/index";
+import type { LooperConfig } from "../config/index";
+import {
+  GhCliGitHubGateway,
+  GitWorktreeGateway,
+  NotificationGateway,
+} from "../infra/index";
+import { ProjectManager } from "../projects/index";
+import { type LooperdApiServer, createLooperdApiServer } from "../server/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import type {
   AgentExecutionRecord,
@@ -13,7 +19,6 @@ import type {
   LoopRecord,
   RunRecord,
 } from "../storage/types";
-import { createLooperdApiServer, type LooperdApiServer } from "../server/index";
 
 export interface RecoverySummary {
   startedAt?: string;
@@ -90,10 +95,26 @@ class BasicLooperdRuntime implements LooperdRuntime {
       this.syncConfiguredProjects();
       this.recoverySummary = this.runRecoveryPipeline();
 
+      const projects =
+        this.options.config.tools.gitPath && this.options.config.tools.ghPath
+          ? new ProjectManager({
+              store,
+              logger: this.options.logger,
+              git: new GitWorktreeGateway({
+                gitPath: this.options.config.tools.gitPath,
+                store,
+              }),
+              github: new GhCliGitHubGateway({
+                ghPath: this.options.config.tools.ghPath,
+              }),
+            })
+          : undefined;
+
       this.server = createLooperdApiServer({
         config: this.options.config,
         logger: this.options.logger,
         store,
+        projects,
         getStartedAt: () => this.startedAt,
         getRecoverySummary: () => ({ ...this.recoverySummary }),
       });

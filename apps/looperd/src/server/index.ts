@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import type { Logger } from "../bootstrap/logger";
+import type { LooperConfig } from "../config/index";
 import {
   assertTaskStatusTransition,
   assertUniqueActiveLoop,
@@ -8,14 +10,13 @@ import {
   definePullRequestLoopTarget,
   defineTaskLoopTarget,
 } from "../domain/index";
-import type { LooperConfig } from "../config/index";
-import type { Logger } from "../bootstrap/logger";
+import type { ProjectManager } from "../projects/index";
+import type { Store } from "../storage/store";
 import type {
   EventLogRecord,
   PullRequestSnapshotRecord,
   RunRecord,
 } from "../storage/types";
-import type { Store } from "../storage/store";
 
 export interface ApiResponse<T> {
   ok: boolean;
@@ -32,6 +33,7 @@ export interface LooperdApiContext {
   config: LooperConfig;
   logger: Logger;
   store: Store;
+  projects?: ProjectManager;
   getStartedAt(): Date | undefined;
   getRecoverySummary(): Record<string, unknown>;
 }
@@ -114,6 +116,9 @@ export function createLooperdApi(context: LooperdApiContext): LooperdApi {
               request.method === "GET"
                 ? buildLoopsResponse(context)
                 : await buildLoopsCreateResponse(context, request);
+            break;
+          case pathname === "/api/v1/projects":
+            data = await buildProjectsRouteResponse(context, request);
             break;
           case pathname.startsWith("/api/v1/loops/"):
             data = await buildLoopRouteResponse(context, request, pathname);
@@ -656,6 +661,54 @@ function buildRunsResponse(
   };
 }
 
+async function buildProjectsRouteResponse(
+  context: LooperdApiContext,
+  request: Request,
+) {
+  if (request.method === "GET") {
+    return {
+      items: context.store.projects
+        .list()
+        .map((project) => serializeProject(project)),
+    };
+  }
+
+  assertMethod(request, ["POST"], "/api/v1/projects");
+  if (!context.projects) {
+    throw new ApiError(
+      "PROJECTS_UNAVAILABLE",
+      500,
+      "Project management is not available in this runtime",
+    );
+  }
+
+  const body = await parseJsonBody(request);
+  const repoPath = readRequiredString(body, "repoPath");
+  const id =
+    readOptionalString(body, "id") ?? deriveProjectIdFromPath(repoPath);
+  const name = readOptionalString(body, "name") ?? id;
+  const baseBranch =
+    readOptionalString(body, "baseBranch") ??
+    context.config.defaults.baseBranch;
+
+  const result = await context.projects.addProject({
+    id,
+    name,
+    repoPath,
+    baseBranch,
+    worktreeRoot: readOptionalString(body, "worktreeRoot"),
+    repo: readOptionalString(body, "repo"),
+  });
+
+  return {
+    ...serializeProject(result.project),
+    repo: result.repo,
+    discoveredPullRequests: result.discoveredPullRequests,
+    discoveredWorktrees: result.discoveredWorktrees,
+    warnings: result.warnings,
+  };
+}
+
 async function buildLoopsCreateResponse(
   context: LooperdApiContext,
   request: Request,
@@ -1091,6 +1144,45 @@ function serializePullRequest(
         }
       : null,
   };
+}
+
+function serializeProject(
+  project: ReturnType<Store["projects"]["list"]>[number],
+) {
+  const metadata = parsePayloadJson(project.metadataJson ?? "null") as Record<
+    string,
+    unknown
+  > | null;
+
+  return {
+    id: project.id,
+    name: project.name,
+    repoPath: project.repoPath,
+    baseBranch: project.baseBranch,
+    archived: project.archived,
+    repo:
+      typeof metadata?.repo === "string" && metadata.repo.length > 0
+        ? metadata.repo
+        : null,
+    worktreeRoot:
+      typeof metadata?.worktreeRoot === "string" &&
+      metadata.worktreeRoot.length > 0
+        ? metadata.worktreeRoot
+        : null,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+  };
+}
+
+function deriveProjectIdFromPath(repoPath: string): string {
+  const segments = repoPath.split(/[\\/]+/).filter(Boolean);
+  const lastSegment = segments.at(-1) ?? "project";
+  const normalized = lastSegment
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalized || "project";
 }
 
 function serializeEvent(event: EventLogRecord) {

@@ -124,6 +124,43 @@ describe("runCli", () => {
     expect(requests[1]).toContain("POST http://127.0.0.1:4310/api/v1/loops");
   });
 
+  test("adds project and requests discovery", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["project", "add", "/tmp/repos/looper"], {
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        requests.push({
+          url: String(input),
+          body: init?.body as string | null,
+        });
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_project_add",
+            data: {
+              id: "looper",
+              name: "looper",
+              repoPath: "/tmp/repos/looper",
+              baseBranch: "main",
+              repo: "powerformer/looper",
+              discoveredPullRequests: 1,
+              discoveredWorktrees: 2,
+              warnings: [],
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toContain("/api/v1/projects");
+    expect(requests[0]?.body).toContain('"id":"looper"');
+    expect(requests[0]?.body).toContain('"name":"looper"');
+    expect(requests[0]?.body).toContain('"repoPath":"/tmp/repos/looper"');
+  });
+
   test("shows daemon logs tail", async () => {
     const lines: string[] = [];
     const exitCode = await runCli(["daemon", "logs", "--lines", "1"], {

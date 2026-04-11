@@ -122,6 +122,14 @@ export class GitWorktreeGateway {
     return parseWorktreeList(result.stdout);
   }
 
+  public async detectGitHubRepo(repoPath: string): Promise<string | null> {
+    const result = await this.runGit(
+      ["config", "--get", "remote.origin.url"],
+      repoPath,
+    );
+    return parseGitHubRepoFromRemoteUrl(result.stdout.trim());
+  }
+
   public async restoreWorktree(input: {
     projectId: string;
     repoPath: string;
@@ -229,6 +237,32 @@ export class GitWorktreeGateway {
       cwd,
     });
   }
+}
+
+function parseGitHubRepoFromRemoteUrl(remoteUrl: string): string | null {
+  if (!remoteUrl) {
+    return null;
+  }
+
+  const sshMatch = /^git@github\.com:(?<repo>.+?)(?:\.git)?$/.exec(remoteUrl);
+  if (sshMatch?.groups?.repo) {
+    return sshMatch.groups.repo;
+  }
+
+  const sshProtocolMatch =
+    /^ssh:\/\/git@github\.com\/(?<repo>.+?)(?:\.git)?$/.exec(remoteUrl);
+  if (sshProtocolMatch?.groups?.repo) {
+    return sshProtocolMatch.groups.repo;
+  }
+
+  const httpsMatch = /^https:\/\/github\.com\/(?<repo>.+?)(?:\.git)?$/.exec(
+    remoteUrl,
+  );
+  if (httpsMatch?.groups?.repo) {
+    return httpsMatch.groups.repo;
+  }
+
+  return null;
 }
 
 function sanitizeBranchName(branch: string): string {

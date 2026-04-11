@@ -3,8 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createDefaultLooperConfig } from "../config/index";
 import { createLogger } from "../bootstrap/logger";
+import { createDefaultLooperConfig } from "../config/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdApi } from "./index";
 
@@ -414,6 +414,66 @@ describe("createLooperdApi", () => {
     expect(createLoopBody.data.repo).toBe("acme/looper");
     expect(createLoopBody.data.prNumber).toBe(43);
     expect(createLoopBody.data.status).toBe("running");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("supports project add route", async () => {
+    const { api, store, rootDir } = await createFixture();
+    const apiWithProjects = createLooperdApi({
+      config: createDefaultLooperConfig(rootDir),
+      logger: await createLogger(
+        createDefaultLooperConfig(rootDir).logging,
+        `${rootDir}/logs-projects`,
+      ),
+      store,
+      projects: {
+        addProject: async (input: {
+          id: string;
+          name: string;
+          repoPath: string;
+          baseBranch: string;
+        }) => ({
+          project: {
+            id: input.id,
+            name: input.name,
+            repoPath: input.repoPath,
+            baseBranch: input.baseBranch,
+            archived: false,
+            metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+            createdAt: "2026-04-11T12:00:00.000Z",
+            updatedAt: "2026-04-11T12:00:00.000Z",
+          },
+          repo: "powerformer/looper",
+          discoveredPullRequests: 1,
+          discoveredWorktrees: 2,
+          warnings: [],
+        }),
+      } as never,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 1 }),
+    });
+
+    const response = await apiWithProjects.handle(
+      new Request("http://localhost/api/v1/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repoPath: "/tmp/repos/looper",
+          id: "looper",
+          name: "Looper",
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      data: { id: string; repo: string; discoveredPullRequests: number };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.data.id).toBe("looper");
+    expect(body.data.repo).toBe("powerformer/looper");
+    expect(body.data.discoveredPullRequests).toBe(1);
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });
