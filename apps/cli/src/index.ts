@@ -404,7 +404,7 @@ function outputCommandHelp(
 function createContext(
   runtime: CliRuntime,
   positionals: string[],
-  options: Record<string, unknown>,
+  options?: Record<string, unknown>,
 ): CliContext {
   return {
     ...runtime,
@@ -414,11 +414,11 @@ function createContext(
 
 function buildParsedArgs(
   positionals: string[],
-  options: Record<string, unknown>,
+  options?: Record<string, unknown>,
 ): ParsedArgs {
   const flags = new Map<string, string[]>();
 
-  for (const [name, value] of Object.entries(options)) {
+  for (const [name, value] of Object.entries(options ?? {})) {
     if (value === undefined || value === false || name === "--") {
       continue;
     }
