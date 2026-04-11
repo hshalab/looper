@@ -258,4 +258,37 @@ describe("runCli", () => {
     expect(output).toContain("paused");
     expect(output).toContain("queued");
   });
+
+  test("uses server.localToken from config for API auth", async () => {
+    const authHeaders: string[] = [];
+    const exitCode = await runCli(["status", "--json"], {
+      stdout: () => {},
+      loadConfigImpl: async () => ({
+        config: {
+          server: {
+            host: "127.0.0.1",
+            port: 4310,
+            baseUrl: "http://127.0.0.1:4310",
+            localToken: "config-token",
+          },
+          daemon: { mode: "foreground", logDir: "/tmp/looper-logs" },
+        },
+        metadata: { configPath: "/tmp/config.json" },
+      }),
+      fetchImpl: async (_input, init) => {
+        const headers = new Headers(init?.headers);
+        authHeaders.push(headers.get("authorization") ?? "");
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_auth",
+            data: { service: { healthy: true } },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(authHeaders[0]).toBe("Bearer config-token");
+  });
 });

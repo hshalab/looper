@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "../bootstrap/logger";
 import type { LooperConfig } from "../config/index";
 import {
+  assertLoopStatusTransition,
   assertTaskStatusTransition,
   assertUniqueActiveLoop,
   createLoop,
@@ -460,7 +461,7 @@ async function buildLoopRouteResponse(
 
   if (subresource === "start") {
     assertMethod(request, ["POST"], pathname);
-    return mutateLoopStatus(context, loopId, "running");
+    return startLoop(context, loopId);
   }
 
   if (subresource === "pause") {
@@ -481,6 +482,10 @@ function mutateLoopStatus(
     throw new ApiError("LOOP_NOT_FOUND", 404, `Loop not found: ${loopId}`);
   }
 
+  if (loop.status === status) {
+    return loop;
+  }
+
   if (
     status === "running" &&
     (loop.type === "reviewer" || loop.type === "fixer") &&
@@ -490,6 +495,16 @@ function mutateLoopStatus(
       "AGENT_NOT_CONFIGURED",
       400,
       `Cannot start ${loop.type} loop without config.agent.vendor`,
+    );
+  }
+
+  try {
+    assertLoopStatusTransition(loop.status as never, status as never);
+  } catch (error) {
+    throw new ApiError(
+      "INVALID_LOOP_TRANSITION",
+      409,
+      error instanceof Error ? error.message : "Invalid loop transition",
     );
   }
 
@@ -503,6 +518,44 @@ function mutateLoopStatus(
   context.store.loops.upsert(updated);
 
   return updated;
+}
+
+function startLoop(context: LooperdApiContext, loopId: string) {
+  const loop = context.store.loops.getById(loopId);
+  if (!loop) {
+    throw new ApiError("LOOP_NOT_FOUND", 404, `Loop not found: ${loopId}`);
+  }
+
+  if (
+    (loop.type === "reviewer" || loop.type === "fixer") &&
+    !isCodingAgentConfigured(context.config)
+  ) {
+    throw new ApiError(
+      "AGENT_NOT_CONFIGURED",
+      400,
+      `Cannot start ${loop.type} loop without config.agent.vendor`,
+    );
+  }
+
+  const startedLoop =
+    loop.status === "running" || loop.status === "queued"
+      ? loop
+      : mutateLoopStatus(context, loopId, "queued");
+
+  const queueItem = ensureLoopQueueItem(
+    context,
+    startedLoop,
+    new Date().toISOString(),
+  );
+  if (startedLoop.status !== "running") {
+    context.store.loops.upsert({
+      ...startedLoop,
+      status: "queued",
+      nextRunAt: queueItem.availableAt,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  return context.store.loops.getById(loopId) ?? startedLoop;
 }
 
 async function buildTasksRouteResponse(
@@ -638,6 +691,21 @@ function startTask(context: LooperdApiContext, taskId: string) {
     throw new ApiError("TASK_NOT_FOUND", 404, `Task not found: ${taskId}`);
   }
 
+  try {
+    if (task.status === "pending") {
+      assertTaskStatusTransition(task.status as never, "ready");
+      assertTaskStatusTransition("ready", "in_progress");
+    } else {
+      assertTaskStatusTransition(task.status as never, "in_progress");
+    }
+  } catch (error) {
+    throw new ApiError(
+      "INVALID_TASK_TRANSITION",
+      409,
+      error instanceof Error ? error.message : "Invalid task transition",
+    );
+  }
+
   const now = new Date().toISOString();
   let loop = task.loopId ? context.store.loops.getById(task.loopId) : null;
 
@@ -651,8 +719,8 @@ function startTask(context: LooperdApiContext, taskId: string) {
       status: "running",
       now,
     });
-  } else if (loop.status !== "running") {
-    loop = mutateLoopStatus(context, loop.id, "running");
+  } else if (loop.status !== "running" && loop.status !== "queued") {
+    loop = startLoop(context, loop.id);
   }
 
   const updatedTask = {
@@ -798,6 +866,10 @@ async function buildLoopsCreateResponse(
     now: new Date().toISOString(),
   });
 
+  if (loop.status === "running" || loop.status === "queued") {
+    ensureLoopQueueItem(context, loop, loop.createdAt);
+  }
+
   return loop;
 }
 
@@ -874,6 +946,68 @@ function createLoopRecord(input: {
 
   context.store.loops.upsert(record);
   return record;
+}
+
+function ensureLoopQueueItem(
+  context: LooperdApiContext,
+  loop: ReturnType<Store["loops"]["getById"]> extends infer T
+    ? Exclude<T, null>
+    : never,
+  now: string,
+) {
+  const existingItem = context.store.queue
+    .list()
+    .find(
+      (candidate) =>
+        candidate.loopId === loop.id &&
+        (candidate.status === "queued" || candidate.status === "running"),
+    );
+  if (existingItem) {
+    return existingItem;
+  }
+
+  const scheduler = new SchedulerQueue({
+    store: context.store,
+    retryMaxAttempts: context.config.scheduler.retryMaxAttempts,
+    retryBaseDelayMs: context.config.scheduler.retryBaseDelayMs,
+    now: () => new Date(now),
+  });
+
+  if (loop.targetType === "task") {
+    const taskId = loop.targetId.startsWith("task:")
+      ? loop.targetId.slice("task:".length)
+      : loop.targetId;
+    const task = context.store.tasks.getById(taskId);
+    return scheduler.enqueue({
+      projectId: loop.projectId,
+      loopId: loop.id,
+      taskId,
+      type: "worker",
+      targetType: "task",
+      targetId: `task:${taskId}`,
+      repo: task?.repo ?? loop.repo,
+      dedupeKey: `worker:${taskId}`,
+    });
+  }
+
+  const repo = readRequiredValue(loop.repo ?? undefined, "repo");
+  const prNumber = readRequiredNumber(loop.prNumber ?? undefined, "prNumber");
+  const targetId = `pr:${repo}:${prNumber}`;
+  const dedupeKey =
+    loop.type === "reviewer"
+      ? `reviewer:${repo}:${prNumber}`
+      : `manual:${loop.type}:${loop.id}`;
+
+  return scheduler.enqueue({
+    projectId: loop.projectId,
+    loopId: loop.id,
+    type: loop.type as "reviewer" | "fixer",
+    targetType: "pull_request",
+    targetId,
+    repo,
+    prNumber,
+    dedupeKey,
+  });
 }
 
 function serializeTask(

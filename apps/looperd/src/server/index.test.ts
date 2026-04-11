@@ -425,7 +425,8 @@ describe("createLooperdApi", () => {
     const startLoopBody = (await startLoopResponse.json()) as {
       data: { status: string };
     };
-    expect(startLoopBody.data.status).toBe("running");
+    expect(startLoopBody.data.status).toBe("queued");
+    expect(["running", "queued"]).toContain(startLoopBody.data.status);
 
     const createTaskResponse = await api.handle(
       new Request("http://localhost/api/v1/tasks", {
@@ -519,6 +520,71 @@ describe("createLooperdApi", () => {
     expect(createLoopBody.data.repo).toBe("acme/looper");
     expect(createLoopBody.data.prNumber).toBe(43);
     expect(createLoopBody.data.status).toBe("running");
+    const createdLoop = store.loops
+      .list()
+      .find((loop) => loop.repo === "acme/looper" && loop.prNumber === 43);
+    expect(createdLoop).toBeDefined();
+    expect(
+      store.queue
+        .list()
+        .some(
+          (item) =>
+            item.loopId === createdLoop?.id &&
+            item.status === "queued" &&
+            item.type === "fixer",
+        ),
+    ).toBe(true);
+
+    store.tasks.upsert({
+      id: "task_completed",
+      projectId: "project_1",
+      title: "Already done",
+      description: null,
+      status: "completed",
+      loopId: null,
+      repo: null,
+      prNumber: null,
+      metadataJson: null,
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+    const startCompletedTaskResponse = await api.handle(
+      new Request("http://localhost/api/v1/tasks/task_completed/start", {
+        method: "POST",
+      }),
+    );
+    const startCompletedTaskBody = (await startCompletedTaskResponse.json()) as {
+      error: { code: string };
+    };
+    expect(startCompletedTaskResponse.status).toBe(409);
+    expect(startCompletedTaskBody.error.code).toBe("INVALID_TASK_TRANSITION");
+
+    store.loops.upsert({
+      id: "loop_completed",
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:44",
+      repo: "acme/looper",
+      prNumber: 44,
+      status: "completed",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: "2026-04-11T12:00:00.000Z",
+      nextRunAt: null,
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+    const startCompletedLoopResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops/loop_completed/start", {
+        method: "POST",
+      }),
+    );
+    const startCompletedLoopBody = (await startCompletedLoopResponse.json()) as {
+      error: { code: string };
+    };
+    expect(startCompletedLoopResponse.status).toBe(409);
+    expect(startCompletedLoopBody.error.code).toBe("INVALID_LOOP_TRANSITION");
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

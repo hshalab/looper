@@ -448,6 +448,12 @@ class BasicLooperdRuntime implements LooperdRuntime {
       }
 
       if (shouldRequeueLoop(loop, latestRun)) {
+        requeueLoopWork({
+          config: this.options.config,
+          store: this.store,
+          loop,
+          nowIso,
+        });
         this.store.loops.upsert({
           ...loop,
           status: "queued",
@@ -592,7 +598,14 @@ class BasicLooperdRuntime implements LooperdRuntime {
 
     this.schedulerTickRunning = true;
     try {
-      await this.discoverPullRequests();
+      try {
+        await this.discoverPullRequests();
+      } catch (error) {
+        this.options.logger.warn("looperd pull request discovery failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
       await this.processScheduledWork();
     } catch (error) {
       this.options.logger.warn("looperd scheduler tick failed", {
@@ -841,6 +854,76 @@ function shouldRequeueLoop(loop: LoopRecord, latestRun: RunRecord): boolean {
   }
 
   return loop.status === "running" || latestRun.status === "interrupted";
+}
+
+function requeueLoopWork(input: {
+  config: LooperConfig;
+  store: SqliteStore;
+  loop: LoopRecord;
+  nowIso: string;
+}) {
+  const activeItem = input.store.queue
+    .list()
+    .find(
+      (candidate) =>
+        candidate.loopId === input.loop.id &&
+        (candidate.status === "queued" || candidate.status === "running"),
+    );
+
+  if (activeItem) {
+    input.store.queue.upsert({
+      ...activeItem,
+      status: "queued",
+      availableAt: input.nowIso,
+      claimedBy: null,
+      claimedAt: null,
+      finishedAt: null,
+      updatedAt: input.nowIso,
+    });
+    return activeItem;
+  }
+
+  const scheduler = new SchedulerQueue({
+    store: input.store,
+    retryMaxAttempts: input.config.scheduler.retryMaxAttempts,
+    retryBaseDelayMs: input.config.scheduler.retryBaseDelayMs,
+    now: () => new Date(input.nowIso),
+  });
+
+  if (input.loop.targetType === "task") {
+    const taskId = input.loop.targetId.startsWith("task:")
+      ? input.loop.targetId.slice("task:".length)
+      : input.loop.targetId;
+    const task = input.store.tasks.getById(taskId);
+    return scheduler.enqueue({
+      projectId: input.loop.projectId,
+      loopId: input.loop.id,
+      taskId,
+      type: "worker",
+      targetType: "task",
+      targetId: `task:${taskId}`,
+      repo: task?.repo ?? input.loop.repo,
+      dedupeKey: `worker:${taskId}`,
+    });
+  }
+
+  if (!input.loop.repo || !input.loop.prNumber) {
+    return null;
+  }
+
+  return scheduler.enqueue({
+    projectId: input.loop.projectId,
+    loopId: input.loop.id,
+    type: input.loop.type as "reviewer" | "fixer",
+    targetType: "pull_request",
+    targetId: `pr:${input.loop.repo}:${input.loop.prNumber}`,
+    repo: input.loop.repo,
+    prNumber: input.loop.prNumber,
+    dedupeKey:
+      input.loop.type === "reviewer"
+        ? `reviewer:${input.loop.repo}:${input.loop.prNumber}`
+        : `manual:${input.loop.type}:${input.loop.id}`,
+  });
 }
 
 function parseProjectMetadata(
