@@ -18,6 +18,20 @@ function createConfig() {
   };
 }
 
+async function withPatchedObjectEntries<T>(
+  fallback: Record<string, unknown>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const original = Object.entries;
+  Object.entries = ((value: unknown) =>
+    original(value ?? fallback)) as typeof Object.entries;
+  try {
+    return await fn();
+  } finally {
+    Object.entries = original;
+  }
+}
+
 describe("runCli", () => {
   test("renders status as json", async () => {
     const lines: string[] = [];
@@ -257,5 +271,178 @@ describe("runCli", () => {
     expect(output).toContain("running");
     expect(output).toContain("paused");
     expect(output).toContain("queued");
+  });
+
+  test("prints active runs as json for ps --json", async () => {
+    const lines: string[] = [];
+    const requests: string[] = [];
+    const exitCode = await withPatchedObjectEntries({ json: true }, async () =>
+      runCli(["ps", "--json"], {
+        stdout: (line) => lines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          requests.push(String(input));
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_ps_json",
+              data: {
+                items: [
+                  {
+                    runId: "run_1",
+                    loopId: "loop_1",
+                    projectId: "project_1",
+                    type: "worker",
+                    status: "running",
+                    currentStep: "execute",
+                    startedAt: "2026-04-11T12:00:00.000Z",
+                    target: {
+                      type: "task",
+                      taskId: "task_1",
+                      label: "Ship CLI",
+                    },
+                    agent: {
+                      active: true,
+                      activeCount: 1,
+                      executionId: "agent_1",
+                      vendor: "opencode",
+                      pid: 1234,
+                      startedAt: "2026-04-11T12:00:01.000Z",
+                      lastHeartbeatAt: "2026-04-11T12:00:02.000Z",
+                      heartbeatCount: 3,
+                      status: "running",
+                    },
+                  },
+                ],
+              },
+            }),
+          );
+        },
+      }),
+    );
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]).toContain("/api/v1/runs/active");
+    expect(lines.join("\n")).toContain('"runId": "run_1"');
+    expect(lines.join("\n")).toContain('"activeCount": 1');
+  });
+
+  test("renders ps table with expected column order and values", async () => {
+    const lines: string[] = [];
+    const originalNow = Date.now;
+    Date.now = () => Date.parse("2026-04-11T12:05:00.000Z");
+
+    try {
+      const exitCode = await withPatchedObjectEntries({}, async () =>
+        runCli(["ps"], {
+          stdout: (line) => lines.push(line),
+          loadConfigImpl: async () => createConfig() as never,
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_ps_table",
+                data: {
+                  items: [
+                    {
+                      runId: "run_worker_1",
+                      loopId: "loop_worker_1",
+                      projectId: "project_1",
+                      type: "worker",
+                      status: "running",
+                      currentStep: "execute",
+                      startedAt: "2026-04-11T12:00:00.000Z",
+                      target: {
+                        type: "task",
+                        taskId: "task_1",
+                        label: "Ship CLI",
+                      },
+                      agent: {
+                        active: true,
+                        activeCount: 2,
+                        executionId: "agent_2",
+                        vendor: "opencode",
+                        pid: 2222,
+                        startedAt: "2026-04-11T12:00:01.000Z",
+                        lastHeartbeatAt: "2026-04-11T12:00:02.000Z",
+                        heartbeatCount: 4,
+                        status: "running",
+                      },
+                    },
+                  ],
+                },
+              }),
+            ),
+        }),
+      );
+
+      expect(exitCode).toBe(0);
+      expect(lines[0]).toContain("type");
+      expect(lines[0]).toContain("target");
+      expect(lines[0]).toContain("run");
+      expect(lines[0]).toContain("step");
+      expect(lines[0]).toContain("agent");
+      expect(lines[0]).toContain("pid");
+      expect(lines[0]).toContain("status");
+      expect(lines[0]).toContain("age");
+      expect(lines[2]).toContain("worker");
+      expect(lines[2]).toContain("Ship CLI");
+      expect(lines[2]).toContain("run_worker_1");
+      expect(lines[2]).toContain("execute");
+      expect(lines[2]).toContain("opencode");
+      expect(lines[2]).toContain("2222");
+      expect(lines[2]).toContain("running");
+      expect(lines[2]).toContain("5m");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  test("prints ps empty state", async () => {
+    const lines: string[] = [];
+    const exitCode = await withPatchedObjectEntries({}, async () =>
+      runCli(["ps"], {
+        stdout: (line) => lines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async () =>
+          new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_ps_empty",
+              data: { items: [] },
+            }),
+          ),
+      }),
+    );
+
+    expect(exitCode).toBe(0);
+    expect(lines).toEqual(["No running loops."]);
+  });
+
+  test("composes ps query params from --type and --project", async () => {
+    const requests: string[] = [];
+    const exitCode = await withPatchedObjectEntries(
+      { type: "reviewer", project: "project_1" },
+      () =>
+        runCli(["ps", "--type", "reviewer", "--project", "project_1"], {
+          stdout: () => {},
+          loadConfigImpl: async () => createConfig() as never,
+          fetchImpl: async (input) => {
+            requests.push(String(input));
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_ps_query",
+                data: { items: [] },
+              }),
+            );
+          },
+        }),
+    );
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]).toContain(
+      "/api/v1/runs/active?type=reviewer&projectId=project_1",
+    );
   });
 });

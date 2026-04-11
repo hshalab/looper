@@ -14,9 +14,12 @@ import type { ProjectManager } from "../projects/index";
 import { SchedulerQueue } from "../scheduler/index";
 import type { Store } from "../storage/store";
 import type {
+  AgentExecutionRecord,
   EventLogRecord,
+  LoopRecord,
   PullRequestSnapshotRecord,
   RunRecord,
+  TaskRecord,
 } from "../storage/types";
 
 export interface ApiResponse<T> {
@@ -133,6 +136,10 @@ export function createLooperdApi(context: LooperdApiContext): LooperdApi {
           case pathname === "/api/v1/runs":
             assertMethod(request, ["GET"], pathname);
             data = buildRunsResponse(context, url.searchParams);
+            break;
+          case pathname === "/api/v1/runs/active":
+            assertMethod(request, ["GET"], pathname);
+            data = buildActiveRunsResponse(context, url.searchParams);
             break;
           default:
             throw new ApiError(
@@ -705,6 +712,266 @@ function buildRunsResponse(
       ? context.store.runs.listByLoop(loopId)
       : context.store.runs.list(),
   };
+}
+
+interface ActiveRunsQuery {
+  type?: string;
+  projectId?: string;
+  taskId?: string;
+  repo?: string;
+  prNumber?: number;
+}
+
+interface ActiveRunAgentSummary {
+  active: true;
+  activeCount: number;
+  executionId: string;
+  vendor: string;
+  pid: number | null;
+  startedAt: string;
+  lastHeartbeatAt: string | null;
+  heartbeatCount: number;
+  status: string;
+}
+
+interface ActiveRunView {
+  runId: string;
+  loopId: string;
+  projectId: string;
+  type: string;
+  status: string;
+  currentStep: string | null;
+  startedAt: string;
+  target:
+    | {
+        type: "task";
+        taskId: string;
+        label: string;
+      }
+    | {
+        type: "pull_request";
+        repo: string;
+        prNumber: number;
+        label: string;
+      };
+  agent: ActiveRunAgentSummary | null;
+}
+
+function buildActiveRunsResponse(
+  context: LooperdApiContext,
+  searchParams: URLSearchParams,
+) {
+  const query = readActiveRunsQuery(searchParams);
+  const items = buildActiveRunViews(context).filter((item) =>
+    matchesActiveRunsQuery(item, query),
+  );
+
+  return { items };
+}
+
+function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
+  const activeRuns = context.store.runs.listByStatus("running");
+  const activeAgentByRunId = buildActiveAgentByRunId(
+    context.store.agentExecutions.listActive(),
+  );
+
+  return activeRuns
+    .map((run) => {
+      const loop = context.store.loops.getById(run.loopId);
+      if (!loop) {
+        return null;
+      }
+
+      const target = tryBuildActiveRunTarget(context, loop);
+      if (!target) {
+        return null;
+      }
+
+      return {
+        runId: run.id,
+        loopId: run.loopId,
+        projectId: loop.projectId,
+        type: loop.type,
+        status: run.status,
+        currentStep: run.currentStep ?? null,
+        startedAt: run.startedAt,
+        target,
+        agent: activeAgentByRunId.get(run.id) ?? null,
+      } satisfies ActiveRunView;
+    })
+    .filter((item): item is ActiveRunView => item !== null)
+    .sort(compareActiveRunViews);
+}
+
+function buildActiveAgentByRunId(
+  executions: AgentExecutionRecord[],
+): Map<string, ActiveRunAgentSummary> {
+  const grouped = new Map<string, AgentExecutionRecord[]>();
+
+  for (const execution of executions) {
+    if (!execution.runId) {
+      continue;
+    }
+
+    const bucket = grouped.get(execution.runId) ?? [];
+    bucket.push(execution);
+    grouped.set(execution.runId, bucket);
+  }
+
+  return new Map(
+    Array.from(grouped.entries()).map(([runId, bucket]) => {
+      const sorted = [...bucket].sort((left, right) =>
+        compareIsoDesc(left.startedAt, right.startedAt),
+      );
+      const primary = sorted[0];
+      if (!primary) {
+        throw new Error(`Missing active execution for run ${runId}`);
+      }
+
+      return [
+        runId,
+        {
+          active: true,
+          activeCount: bucket.length,
+          executionId: primary.id,
+          vendor: primary.vendor,
+          pid: primary.pid ?? null,
+          startedAt: primary.startedAt,
+          lastHeartbeatAt: primary.lastHeartbeatAt ?? null,
+          heartbeatCount: primary.heartbeatCount,
+          status: primary.status,
+        } satisfies ActiveRunAgentSummary,
+      ];
+    }),
+  );
+}
+
+function tryBuildActiveRunTarget(
+  context: LooperdApiContext,
+  loop: LoopRecord,
+): ActiveRunView["target"] | null {
+  if (loop.targetType === "task") {
+    const taskId =
+      loop.targetId?.startsWith("task:") === true
+        ? loop.targetId.slice("task:".length)
+        : loop.targetId;
+    if (!taskId) {
+      return null;
+    }
+
+    const task = context.store.tasks.getById(taskId);
+
+    return {
+      type: "task",
+      taskId,
+      label: task?.title?.trim() || taskId,
+    };
+  }
+
+  if (!loop.repo || !loop.prNumber) {
+    return null;
+  }
+
+  return {
+    type: "pull_request",
+    repo: loop.repo,
+    prNumber: loop.prNumber,
+    label: `${loop.repo}#${loop.prNumber}`,
+  };
+}
+
+function readActiveRunsQuery(searchParams: URLSearchParams): ActiveRunsQuery {
+  const type = searchParams.get("type")?.trim() || undefined;
+  const projectId = searchParams.get("projectId")?.trim() || undefined;
+  const taskId = searchParams.get("taskId")?.trim() || undefined;
+  const repo = searchParams.get("repo")?.trim() || undefined;
+  const prNumberValue = searchParams.get("prNumber")?.trim();
+  const prNumber = prNumberValue
+    ? readSearchParamPositiveInteger(prNumberValue, "prNumber")
+    : undefined;
+
+  if ((repo && prNumber === undefined) || (!repo && prNumber !== undefined)) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      "repo and prNumber must be provided together",
+    );
+  }
+
+  return { type, projectId, taskId, repo, prNumber };
+}
+
+function readSearchParamPositiveInteger(
+  value: string,
+  fieldName: string,
+): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `${fieldName} must be a positive integer`,
+    );
+  }
+
+  return parsed;
+}
+
+function matchesActiveRunsQuery(
+  item: ActiveRunView,
+  query: ActiveRunsQuery,
+): boolean {
+  if (query.type && item.type !== query.type) {
+    return false;
+  }
+
+  if (query.projectId && item.projectId !== query.projectId) {
+    return false;
+  }
+
+  if (query.taskId) {
+    if (item.target.type !== "task" || item.target.taskId !== query.taskId) {
+      return false;
+    }
+  }
+
+  if (query.repo || query.prNumber !== undefined) {
+    if (
+      item.target.type !== "pull_request" ||
+      item.target.repo !== query.repo ||
+      item.target.prNumber !== query.prNumber
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function compareActiveRunViews(
+  left: ActiveRunView,
+  right: ActiveRunView,
+): number {
+  const leftHasActiveAgent = left.agent ? 1 : 0;
+  const rightHasActiveAgent = right.agent ? 1 : 0;
+  if (leftHasActiveAgent !== rightHasActiveAgent) {
+    return rightHasActiveAgent - leftHasActiveAgent;
+  }
+
+  const startedAtComparison = compareIsoAsc(left.startedAt, right.startedAt);
+  if (startedAtComparison !== 0) {
+    return startedAtComparison;
+  }
+
+  return left.runId.localeCompare(right.runId);
+}
+
+function compareIsoAsc(left: string, right: string): number {
+  return left.localeCompare(right);
+}
+
+function compareIsoDesc(left: string, right: string): number {
+  return right.localeCompare(left);
 }
 
 async function buildProjectsRouteResponse(

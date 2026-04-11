@@ -527,4 +527,92 @@ describe("SqliteStore", () => {
 
     store.close();
   });
+
+  test("lists runs by status in stable newest-first order", async () => {
+    const fixture = await createStoreFixture();
+    const store = new SqliteStore({ dbPath: fixture.dbPath });
+    store.initialize({ autoMigrate: true });
+
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: "/tmp/looper",
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: "2026-04-11T11:59:00.000Z",
+      updatedAt: "2026-04-11T11:59:00.000Z",
+    });
+    store.loops.upsert({
+      id: "loop_1",
+      projectId: "project_1",
+      type: "worker",
+      targetType: "task",
+      targetId: "task:task_1",
+      repo: null,
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: "2026-04-11T12:00:00.000Z",
+      createdAt: "2026-04-11T11:59:30.000Z",
+      updatedAt: "2026-04-11T11:59:30.000Z",
+    });
+
+    store.runs.upsert({
+      id: "run_old_running",
+      loopId: "loop_1",
+      status: "running",
+      currentStep: "step_old",
+      lastCompletedStep: null,
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:00:00.000Z",
+      lastHeartbeatAt: "2026-04-11T12:00:00.000Z",
+      endedAt: null,
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+    store.runs.upsert({
+      id: "run_new_running",
+      loopId: "loop_1",
+      status: "running",
+      currentStep: "step_new",
+      lastCompletedStep: null,
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:05:00.000Z",
+      lastHeartbeatAt: "2026-04-11T12:05:00.000Z",
+      endedAt: null,
+      createdAt: "2026-04-11T12:05:00.000Z",
+      updatedAt: "2026-04-11T12:05:00.000Z",
+    });
+    store.runs.upsert({
+      id: "run_done",
+      loopId: "loop_1",
+      status: "completed",
+      currentStep: "done",
+      lastCompletedStep: "done",
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:10:00.000Z",
+      lastHeartbeatAt: "2026-04-11T12:10:00.000Z",
+      endedAt: "2026-04-11T12:12:00.000Z",
+      createdAt: "2026-04-11T12:10:00.000Z",
+      updatedAt: "2026-04-11T12:12:00.000Z",
+    });
+
+    const running = store.runs.listByStatus("running");
+    expect(running.map((run) => run.id)).toEqual([
+      "run_new_running",
+      "run_old_running",
+    ]);
+    expect(running.every((run) => run.status === "running")).toBe(true);
+
+    store.close();
+  });
 });

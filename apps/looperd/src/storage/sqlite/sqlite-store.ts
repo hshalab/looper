@@ -183,6 +183,14 @@ export class SqliteStore implements Store {
         .all() as Record<string, unknown>[];
       return rows.map(mapRun);
     },
+    listByStatus: (status: RunRecord["status"]): RunRecord[] => {
+      const rows = this.coordinator.db
+        .query(
+          "SELECT * FROM runs WHERE status = ?1 ORDER BY started_at DESC, id DESC",
+        )
+        .all(status) as Record<string, unknown>[];
+      return rows.map(mapRun);
+    },
     listByLoop: (loopId: string): RunRecord[] => {
       const rows = this.coordinator.db
         .query("SELECT * FROM runs WHERE loop_id = ?1 ORDER BY started_at DESC")

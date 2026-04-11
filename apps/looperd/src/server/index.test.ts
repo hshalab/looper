@@ -664,4 +664,370 @@ describe("createLooperdApi", () => {
     store.close();
     await rm(rootDir, { recursive: true, force: true });
   });
+
+  test("returns an empty active-runs list when no runs are running", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    const existingRun = store.runs.getById("run_1");
+    if (!existingRun) {
+      throw new Error("expected run_1 to exist");
+    }
+    store.runs.upsert({
+      ...existingRun,
+      status: "completed",
+      endedAt: "2026-04-11T12:10:00.000Z",
+      updatedAt: "2026-04-11T12:10:00.000Z",
+    });
+
+    const response = await api.handle(
+      new Request("http://localhost/api/v1/runs/active"),
+    );
+    const body = (await response.json()) as {
+      data: { items: Array<Record<string, unknown>> };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.data.items).toEqual([]);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("returns active runs with target/agent shapes, collapse rules, and filters", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    store.loops.upsert({
+      id: "loop_worker_1",
+      projectId: "project_1",
+      type: "worker",
+      targetType: "task",
+      targetId: "task:task_2",
+      repo: null,
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: "2026-04-11T12:01:00.000Z",
+      nextRunAt: "2026-04-11T12:01:00.000Z",
+      createdAt: "2026-04-11T12:01:00.000Z",
+      updatedAt: "2026-04-11T12:01:00.000Z",
+    });
+    store.tasks.upsert({
+      id: "task_2",
+      projectId: "project_1",
+      title: "Implement ps command",
+      description: null,
+      status: "in_progress",
+      loopId: "loop_worker_1",
+      repo: null,
+      prNumber: null,
+      metadataJson: null,
+      createdAt: "2026-04-11T12:01:00.000Z",
+      updatedAt: "2026-04-11T12:01:00.000Z",
+    });
+    store.runs.upsert({
+      id: "run_worker_1",
+      loopId: "loop_worker_1",
+      status: "running",
+      currentStep: "execute",
+      lastCompletedStep: null,
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:01:00.000Z",
+      lastHeartbeatAt: "2026-04-11T12:01:30.000Z",
+      endedAt: null,
+      createdAt: "2026-04-11T12:01:00.000Z",
+      updatedAt: "2026-04-11T12:01:30.000Z",
+    });
+
+    store.loops.upsert({
+      id: "loop_fixer_1",
+      projectId: "project_1",
+      type: "fixer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:43",
+      repo: "acme/looper",
+      prNumber: 43,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: "2026-04-11T12:02:00.000Z",
+      nextRunAt: "2026-04-11T12:02:00.000Z",
+      createdAt: "2026-04-11T12:02:00.000Z",
+      updatedAt: "2026-04-11T12:02:00.000Z",
+    });
+    store.runs.upsert({
+      id: "run_fixer_1",
+      loopId: "loop_fixer_1",
+      status: "running",
+      currentStep: "fix",
+      lastCompletedStep: null,
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:02:00.000Z",
+      lastHeartbeatAt: "2026-04-11T12:02:30.000Z",
+      endedAt: null,
+      createdAt: "2026-04-11T12:02:00.000Z",
+      updatedAt: "2026-04-11T12:02:30.000Z",
+    });
+
+    // fallback label should use task id when task title is unavailable
+    store.loops.upsert({
+      id: "loop_worker_fallback",
+      projectId: "project_1",
+      type: "worker",
+      targetType: "task",
+      targetId: "task:task_fallback",
+      repo: null,
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: "2026-04-11T12:03:00.000Z",
+      nextRunAt: "2026-04-11T12:03:00.000Z",
+      createdAt: "2026-04-11T12:03:00.000Z",
+      updatedAt: "2026-04-11T12:03:00.000Z",
+    });
+    store.runs.upsert({
+      id: "run_worker_fallback",
+      loopId: "loop_worker_fallback",
+      status: "running",
+      currentStep: "plan",
+      lastCompletedStep: null,
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:03:00.000Z",
+      lastHeartbeatAt: "2026-04-11T12:03:30.000Z",
+      endedAt: null,
+      createdAt: "2026-04-11T12:03:00.000Z",
+      updatedAt: "2026-04-11T12:03:30.000Z",
+    });
+
+    // null-runId active execution is ignored
+    store.agentExecutions.upsert({
+      id: "agent_exec_null_run",
+      projectId: "project_1",
+      loopId: "loop_worker_1",
+      runId: null,
+      taskId: "task_2",
+      vendor: "opencode",
+      status: "running",
+      pid: 99901,
+      commandJson: "{}",
+      cwd: "/tmp/looper",
+      summary: null,
+      parseStatus: null,
+      completionSignal: null,
+      heartbeatCount: 1,
+      lastHeartbeatAt: "2026-04-11T12:02:00.000Z",
+      outputJson: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:02:00.000Z",
+      endedAt: null,
+      metadataJson: null,
+      createdAt: "2026-04-11T12:02:00.000Z",
+      updatedAt: "2026-04-11T12:02:00.000Z",
+    });
+
+    // duplicate active executions collapse to one agent summary with activeCount
+    store.agentExecutions.upsert({
+      id: "agent_exec_worker_old",
+      projectId: "project_1",
+      loopId: "loop_worker_1",
+      runId: "run_worker_1",
+      taskId: "task_2",
+      vendor: "opencode",
+      status: "running",
+      pid: 11111,
+      commandJson: "{}",
+      cwd: "/tmp/looper",
+      summary: null,
+      parseStatus: null,
+      completionSignal: null,
+      heartbeatCount: 2,
+      lastHeartbeatAt: "2026-04-11T12:01:40.000Z",
+      outputJson: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:01:10.000Z",
+      endedAt: null,
+      metadataJson: null,
+      createdAt: "2026-04-11T12:01:10.000Z",
+      updatedAt: "2026-04-11T12:01:40.000Z",
+    });
+    store.agentExecutions.upsert({
+      id: "agent_exec_worker_new",
+      projectId: "project_1",
+      loopId: "loop_worker_1",
+      runId: "run_worker_1",
+      taskId: "task_2",
+      vendor: "opencode",
+      status: "running",
+      pid: 22222,
+      commandJson: "{}",
+      cwd: "/tmp/looper",
+      summary: null,
+      parseStatus: null,
+      completionSignal: null,
+      heartbeatCount: 5,
+      lastHeartbeatAt: "2026-04-11T12:01:50.000Z",
+      outputJson: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:01:20.000Z",
+      endedAt: null,
+      metadataJson: null,
+      createdAt: "2026-04-11T12:01:20.000Z",
+      updatedAt: "2026-04-11T12:01:50.000Z",
+    });
+    store.agentExecutions.upsert({
+      id: "agent_exec_fixer",
+      projectId: "project_1",
+      loopId: "loop_fixer_1",
+      runId: "run_fixer_1",
+      taskId: null,
+      vendor: "opencode",
+      status: "running",
+      pid: 33333,
+      commandJson: "{}",
+      cwd: "/tmp/looper",
+      summary: null,
+      parseStatus: null,
+      completionSignal: null,
+      heartbeatCount: 3,
+      lastHeartbeatAt: "2026-04-11T12:02:40.000Z",
+      outputJson: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:02:10.000Z",
+      endedAt: null,
+      metadataJson: null,
+      createdAt: "2026-04-11T12:02:10.000Z",
+      updatedAt: "2026-04-11T12:02:40.000Z",
+    });
+
+    const response = await api.handle(
+      new Request("http://localhost/api/v1/runs/active"),
+    );
+    const body = (await response.json()) as {
+      data: {
+        items: Array<{
+          runId: string;
+          type: string;
+          currentStep: string | null;
+          target: { type: string; label: string; taskId?: string };
+          agent: {
+            executionId: string;
+            activeCount: number;
+            pid: number | null;
+          } | null;
+        }>;
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.data.items.map((item) => item.runId)).toEqual([
+      "run_worker_1",
+      "run_fixer_1",
+      "run_1",
+      "run_worker_fallback",
+    ]);
+
+    const reviewer = body.data.items.find((item) => item.runId === "run_1");
+    expect(reviewer).toMatchObject({
+      type: "reviewer",
+      currentStep: "review",
+      target: {
+        type: "pull_request",
+        label: "acme/looper#42",
+      },
+      agent: null,
+    });
+
+    const worker = body.data.items.find(
+      (item) => item.runId === "run_worker_1",
+    );
+    expect(worker).toMatchObject({
+      type: "worker",
+      currentStep: "execute",
+      target: {
+        type: "task",
+        taskId: "task_2",
+        label: "Implement ps command",
+      },
+      agent: {
+        executionId: "agent_exec_worker_new",
+        activeCount: 2,
+        pid: 22222,
+      },
+    });
+
+    const fixer = body.data.items.find((item) => item.runId === "run_fixer_1");
+    expect(fixer).toMatchObject({
+      type: "fixer",
+      currentStep: "fix",
+      target: {
+        type: "pull_request",
+        label: "acme/looper#43",
+      },
+      agent: {
+        executionId: "agent_exec_fixer",
+        activeCount: 1,
+        pid: 33333,
+      },
+    });
+
+    const fallbackTaskTarget = body.data.items.find(
+      (item) => item.runId === "run_worker_fallback",
+    );
+    expect(fallbackTaskTarget?.target).toMatchObject({
+      type: "task",
+      taskId: "task_fallback",
+      label: "task_fallback",
+    });
+
+    const typeFiltered = await api.handle(
+      new Request("http://localhost/api/v1/runs/active?type=worker"),
+    );
+    const typeFilteredBody = (await typeFiltered.json()) as {
+      data: { items: Array<{ runId: string }> };
+    };
+    expect(typeFilteredBody.data.items.map((item) => item.runId)).toEqual([
+      "run_worker_1",
+      "run_worker_fallback",
+    ]);
+
+    const projectFiltered = await api.handle(
+      new Request("http://localhost/api/v1/runs/active?projectId=project_1"),
+    );
+    const projectFilteredBody = (await projectFiltered.json()) as {
+      data: { items: Array<{ runId: string }> };
+    };
+    expect(projectFilteredBody.data.items).toHaveLength(4);
+
+    const taskFiltered = await api.handle(
+      new Request("http://localhost/api/v1/runs/active?taskId=task_2"),
+    );
+    const taskFilteredBody = (await taskFiltered.json()) as {
+      data: { items: Array<{ runId: string }> };
+    };
+    expect(taskFilteredBody.data.items.map((item) => item.runId)).toEqual([
+      "run_worker_1",
+    ]);
+
+    const prFiltered = await api.handle(
+      new Request(
+        "http://localhost/api/v1/runs/active?repo=acme%2Flooper&prNumber=43",
+      ),
+    );
+    const prFilteredBody = (await prFiltered.json()) as {
+      data: { items: Array<{ runId: string }> };
+    };
+    expect(prFilteredBody.data.items.map((item) => item.runId)).toEqual([
+      "run_fixer_1",
+    ]);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
 });
