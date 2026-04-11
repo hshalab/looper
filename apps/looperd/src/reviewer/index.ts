@@ -68,6 +68,14 @@ export interface ReviewerLoopRunnerOptions {
   github: ReviewerGitHubGateway;
   agentExecutor: ReviewerAgentExecutor;
   logger: Logger;
+  onAgentExecutionStarted?: (input: {
+    executionId: string;
+    projectId: string;
+    loopId: string;
+    runId: string;
+    body: string;
+    dedupeKey: string;
+  }) => Promise<void> | void;
   now?: () => Date;
   agentTimeoutMs?: number;
   claimTtlMs?: number;
@@ -689,8 +697,9 @@ export class ReviewerLoopRunner {
       snapshot,
     });
 
+    const executionId = randomUUID();
     const execution = await this.options.agentExecutor.start({
-      executionId: randomUUID(),
+      executionId,
       projectId: input.project.id,
       loopId: input.loop.id,
       runId: input.run.id,
@@ -703,6 +712,14 @@ export class ReviewerLoopRunner {
         prNumber: input.queueItem.prNumber,
       },
       idempotencyKey: `reviewer:${input.loop.id}:${snapshot.headSha}`,
+    });
+    await this.options.onAgentExecutionStarted?.({
+      executionId,
+      projectId: input.project.id,
+      loopId: input.loop.id,
+      runId: input.run.id,
+      body: `Reviewer agent started for ${repo}#${prNumber}`,
+      dedupeKey: `runtime.agent.started:reviewer:${input.run.id}`,
     });
     const result = await execution.wait();
 

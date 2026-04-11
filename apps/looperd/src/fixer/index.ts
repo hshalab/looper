@@ -128,6 +128,14 @@ export interface FixerLoopRunnerOptions {
   git: FixerGitGateway;
   agentExecutor: FixerAgentExecutor;
   logger: Logger;
+  onAgentExecutionStarted?: (input: {
+    executionId: string;
+    projectId: string;
+    loopId: string;
+    runId: string;
+    body: string;
+    dedupeKey: string;
+  }) => Promise<void> | void;
   now?: () => Date;
   agentTimeoutMs?: number;
   claimTtlMs?: number;
@@ -888,6 +896,14 @@ export class FixerLoopRunner {
       },
       idempotencyKey: `fixer:${input.loop.id}:${input.checkpoint.fixItemsHash ?? "unknown"}:${detail?.headSha ?? "unknown"}`,
     });
+    await this.options.onAgentExecutionStarted?.({
+      executionId,
+      projectId: input.loop.projectId,
+      loopId: input.loop.id,
+      runId: input.run.id,
+      body: `Fixer agent started for ${requireString(input.queueItem.repo, "queueItem.repo")}#${requireNumber(input.queueItem.prNumber, "queueItem.prNumber")}`,
+      dedupeKey: `runtime.agent.started:fixer:${input.run.id}`,
+    });
     const result = await execution.wait();
     if (result.status !== "completed") {
       throw new FixerLoopError(
@@ -1355,6 +1371,7 @@ export class FixerLoopRunner {
     const restartFromDiscovery = shouldRestartFromDiscovery({
       latestRunStatus: latestRun?.status,
       failedStep,
+      failureSummary: latestRun?.summary ?? latestRun?.errorMessage,
     });
     const resumeFromPrepare = shouldResumeFromPrepare({
       latestRunStatus: latestRun?.status,
@@ -2065,6 +2082,7 @@ function shouldResumeFromPrepare(input: {
 function shouldRestartFromDiscovery(input: {
   latestRunStatus?: string | null;
   failedStep: FixerStep | null;
+  failureSummary?: string | null;
 }): boolean {
   if (
     input.latestRunStatus !== "failed" &&
@@ -2073,7 +2091,21 @@ function shouldRestartFromDiscovery(input: {
     return false;
   }
 
-  return input.failedStep === "prepare-worktree";
+  if (input.failedStep === "prepare-worktree") {
+    return true;
+  }
+
+  if (input.failedStep !== "resolve-comments") {
+    return false;
+  }
+
+  if (input.latestRunStatus === "interrupted") {
+    return true;
+  }
+
+  return (input.failureSummary ?? "").includes(
+    "PR head changed before resolving comments",
+  );
 }
 
 function shouldRebuildWorktree(checkpoint: FixerCheckpoint): boolean {

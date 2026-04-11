@@ -378,6 +378,7 @@ describe("FixerLoopRunner", () => {
           headSha: "commit-1",
         },
         { comments: [], checks: [], headSha: "commit-1" },
+        { comments: [], checks: [], headSha: "commit-1" },
       ],
     });
     const git = new FakeGitGateway();
@@ -446,6 +447,89 @@ describe("FixerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("emits agent-start callback when fixer executor starts", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      views: [
+        {
+          comments: [
+            {
+              id: "comment-1",
+              body: "Please fix this",
+              path: "src/index.ts",
+              line: 10,
+              threadId: "thread-1",
+            },
+          ],
+          checks: [],
+          headSha: "abc123",
+        },
+        {
+          comments: [
+            {
+              id: "comment-1",
+              body: "Please fix this",
+              path: "src/index.ts",
+              line: 10,
+              threadId: "thread-1",
+            },
+          ],
+          checks: [],
+          headSha: "abc123",
+        },
+        { comments: [], checks: [], headSha: "commit-1" },
+        { comments: [], checks: [], headSha: "commit-1" },
+      ],
+    });
+    const git = new FakeGitGateway();
+    const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
+    const notifications: Array<{
+      executionId: string;
+      projectId: string;
+      loopId: string;
+      runId: string;
+      body: string;
+      dedupeKey: string;
+    }> = [];
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      git,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+      }),
+      onAgentExecutionStarted: (input) => {
+        notifications.push(input);
+      },
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("fixer-1");
+    if (!claimed) {
+      throw new Error("Expected claimed fixer queue item");
+    }
+
+    await runner.processClaimedItem(claimed);
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.body).toBe(
+      "Fixer agent started for acme/looper#42",
+    );
+    expect(notifications[0]?.dedupeKey).toMatch(
+      /^runtime\.agent\.started:fixer:/,
+    );
+
+    fixture.store.close();
+  });
+
   test("retries from recheck without rerunning repair after recheck failure", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
@@ -481,6 +565,7 @@ describe("FixerLoopRunner", () => {
           ],
           headSha: "commit-1",
         },
+        { comments: [], checks: [], headSha: "commit-1" },
         "error",
         { comments: [], checks: [], headSha: "commit-1" },
       ],
@@ -797,6 +882,7 @@ describe("FixerLoopRunner", () => {
           headSha: "looperd-commit-2",
         },
         { comments: [], checks: [], headSha: "looperd-commit-2" },
+        { comments: [], checks: [], headSha: "looperd-commit-2" },
       ],
     });
     const git = new FakeGitGateway({
@@ -1065,6 +1151,11 @@ describe("FixerLoopRunner", () => {
           checks: [],
           headSha: "commit-1",
         },
+        {
+          comments: [],
+          checks: [],
+          headSha: "commit-1",
+        },
       ],
     });
     const git = new FakeGitGateway({
@@ -1114,7 +1205,7 @@ describe("FixerLoopRunner", () => {
     fixture.store.close();
   });
 
-  test("fails resolve-comments when PR head changes after push", async () => {
+  test("retries resolve-comments head changes from discover-pr with fresh PR detail", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
       views: [
@@ -1138,15 +1229,101 @@ describe("FixerLoopRunner", () => {
           checks: [],
           headSha: "new-head",
         },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "new-head",
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "new-head",
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "new-head",
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "abc123",
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "abc123",
+        },
+        { comments: [], checks: [], headSha: "abc123" },
+        { comments: [], checks: [], headSha: "abc123" },
+        { comments: [], checks: [], headSha: "abc123" },
+        { comments: [], checks: [], headSha: "abc123" },
+        { comments: [], checks: [], headSha: "abc123" },
+        { comments: [], checks: [], headSha: "abc123" },
       ],
     });
-    const git = new FakeGitGateway();
+    const git = new FakeGitGateway({
+      inspectResults: [
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+      ],
+    });
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("fixed-attempt-1"),
+      completedAgentResult("fixed-attempt-2"),
+    ]);
     const runner = new FixerLoopRunner({
       store: fixture.store,
       scheduler: fixture.queue,
       github,
       git,
-      agentExecutor: new FakeAgentExecutor([completedAgentResult("fixed")]),
+      agentExecutor: agent,
       logger: createCapturingLogger().logger,
       now: () => fixture.now,
       sleep: async () => {},
@@ -1160,16 +1337,29 @@ describe("FixerLoopRunner", () => {
       projectId: "project_1",
       repo: "acme/looper",
     });
-    const claimed = fixture.queue.claimNext("fixer-1");
-    if (!claimed) throw new Error("Expected fixer claim");
+    const firstClaim = fixture.queue.claimNext("fixer-1");
+    if (!firstClaim) throw new Error("Expected first fixer claim");
 
-    const result = await runner.processClaimedItem(claimed);
-    expect(result.status).toBe("failed");
-    expect(result.failureKind).toBe("retryable_after_resume");
-    expect(result.summary).toContain(
+    const first = await runner.processClaimedItem(firstClaim);
+    expect(first.status).toBe("failed");
+    expect(first.failureKind).toBe("retryable_after_resume");
+    expect(first.summary).toContain(
       "PR head changed before resolving comments",
     );
     expect(github.resolvedThreadIds).toEqual([]);
+    expect(agent.starts).toHaveLength(1);
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("fixer-1");
+    if (!retryClaim) throw new Error("Expected retry fixer claim");
+    const retry = await runner.processClaimedItem(retryClaim);
+    if (retry.status === "failed") {
+      throw new Error(`Retry failed: ${retry.summary}`);
+    }
+
+    expect(retry.status).toBe("success");
+    expect(agent.starts).toHaveLength(2);
+    expect(github.resolvedThreadIds).toEqual(["thread-1"]);
 
     fixture.store.close();
   });
@@ -1198,6 +1388,7 @@ describe("FixerLoopRunner", () => {
           checks: [],
           headSha: "commit-1",
         },
+        { comments: [], checks: [], headSha: "commit-1" },
         { comments: [], checks: [], headSha: "commit-1" },
       ],
     });

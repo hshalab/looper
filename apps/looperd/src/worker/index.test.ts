@@ -379,6 +379,58 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("emits agent-start callback when worker executor starts", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and committed changes", [
+        "abc123",
+      ]),
+    ]);
+    const notifications: Array<{
+      executionId: string;
+      projectId: string;
+      loopId: string;
+      runId: string;
+      body: string;
+      dedupeKey: string;
+    }> = [];
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+      onAgentExecutionStarted: (input) => {
+        notifications.push(input);
+      },
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    await runner.processClaimedItem(claimed);
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.body).toBe("Worker agent started for task task_1");
+    expect(notifications[0]?.dedupeKey).toMatch(
+      /^runtime\.agent\.started:worker:/,
+    );
+
+    fixture.store.close();
+  });
+
   test("keeps checklist items in progress when validation fails and requeues", async () => {
     const fixture = await createFixture();
     const git = new FakeGitGateway(fixture.worktreeRoot);

@@ -345,6 +345,54 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("emits agent-start callback when reviewer executor starts", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Looks good overall"),
+    ]);
+    const notifications: Array<{
+      executionId: string;
+      projectId: string;
+      loopId: string;
+      runId: string;
+      body: string;
+      dedupeKey: string;
+    }> = [];
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      onAgentExecutionStarted: (input) => {
+        notifications.push(input);
+      },
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    await runner.processClaimedItem(claimed);
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.body).toBe(
+      "Reviewer agent started for acme/looper#42",
+    );
+    expect(notifications[0]?.dedupeKey).toMatch(
+      /^runtime\.agent\.started:reviewer:/,
+    );
+
+    fixture.store.close();
+  });
+
   test("retries publish from checkpoint without rerunning review", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway();

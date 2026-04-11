@@ -83,6 +83,14 @@ export interface WorkerLoopRunnerOptions {
   github: WorkerGitHubGateway;
   agentExecutor: WorkerAgentExecutor;
   logger: Logger;
+  onAgentExecutionStarted?: (input: {
+    executionId: string;
+    projectId: string;
+    loopId: string;
+    runId: string;
+    body: string;
+    dedupeKey: string;
+  }) => Promise<void> | void;
   now?: () => Date;
   agentTimeoutMs?: number;
   claimTtlMs?: number;
@@ -681,8 +689,9 @@ export class WorkerLoopRunner {
       task: taskInfo,
       items: plannedItems,
     });
+    const executionId = randomUUID();
     const execution = await this.options.agentExecutor.start({
-      executionId: randomUUID(),
+      executionId,
       projectId: input.project.id,
       loopId: input.loop.id,
       runId: input.run.id,
@@ -696,6 +705,14 @@ export class WorkerLoopRunner {
         plannedItemIds: plannedItems.map((item) => item.id),
       },
       idempotencyKey: `worker:${input.loop.id}:${plannedItems.map((item) => item.id).join(",")}`,
+    });
+    await this.options.onAgentExecutionStarted?.({
+      executionId,
+      projectId: input.project.id,
+      loopId: input.loop.id,
+      runId: input.run.id,
+      body: `Worker agent started for task ${input.task.id}`,
+      dedupeKey: `runtime.agent.started:worker:${input.run.id}`,
     });
     const result = await execution.wait();
 

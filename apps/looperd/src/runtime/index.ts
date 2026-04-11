@@ -183,6 +183,19 @@ class BasicLooperdRuntime implements LooperdRuntime {
             github,
             agentExecutor,
             logger: this.options.logger,
+            onAgentExecutionStarted: (input) =>
+              this.notifySystemEvent({
+                projectId: input.projectId,
+                loopId: input.loopId,
+                runId: input.runId,
+                level: "info",
+                title: "looperd Agent 已启动",
+                subtitle: "reviewer",
+                body: input.body,
+                entityType: "agent_execution",
+                entityId: input.executionId,
+                dedupeKey: input.dedupeKey,
+              }),
             allowAutoApprove: this.options.config.defaults.allowAutoApprove,
           });
       }
@@ -202,6 +215,19 @@ class BasicLooperdRuntime implements LooperdRuntime {
             git,
             agentExecutor,
             logger: this.options.logger,
+            onAgentExecutionStarted: (input) =>
+              this.notifySystemEvent({
+                projectId: input.projectId,
+                loopId: input.loopId,
+                runId: input.runId,
+                level: "info",
+                title: "looperd Agent 已启动",
+                subtitle: "fixer",
+                body: input.body,
+                entityType: "agent_execution",
+                entityId: input.executionId,
+                dedupeKey: input.dedupeKey,
+              }),
             allowAutoCommit: this.options.config.defaults.allowAutoCommit,
             allowAutoPush: this.options.config.defaults.allowAutoPush,
             allowRiskyFixes: this.options.config.defaults.allowRiskyFixes,
@@ -218,6 +244,19 @@ class BasicLooperdRuntime implements LooperdRuntime {
             git,
             agentExecutor,
             logger: this.options.logger,
+            onAgentExecutionStarted: (input) =>
+              this.notifySystemEvent({
+                projectId: input.projectId,
+                loopId: input.loopId,
+                runId: input.runId,
+                level: "info",
+                title: "looperd Agent 已启动",
+                subtitle: "worker",
+                body: input.body,
+                entityType: "agent_execution",
+                entityId: input.executionId,
+                dedupeKey: input.dedupeKey,
+              }),
             allowAutoCommit: this.options.config.defaults.allowAutoCommit,
             allowAutoPush: this.options.config.defaults.allowAutoPush,
           });
