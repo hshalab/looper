@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 
-import type { AgentResult, AgentRunInput } from "../infra/agent";
 import type { Logger } from "../bootstrap/logger";
+import type { AgentResult, AgentRunInput } from "../infra/agent";
+import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError } from "../infra/command";
 import type {
   GitHubPullRequestDetail,
@@ -1185,21 +1186,23 @@ function buildReviewPrompt(input: {
   const parsedPayload = parseJsonObject(input.snapshot.payloadJson);
   const diff = readString(parsedPayload.diff);
 
-  return [
-    `Review pull request ${input.repo}#${input.prNumber}.`,
-    input.snapshot.title ? `Title: ${input.snapshot.title}` : null,
-    input.snapshot.body ? `Body:\n${input.snapshot.body}` : null,
-    input.detail?.author ? `Author: ${input.detail.author}` : null,
-    `Head SHA: ${input.snapshot.headSha}`,
-    input.snapshot.checksSummary
-      ? `Checks: ${input.snapshot.checksSummary}`
-      : null,
-    typeof input.snapshot.unresolvedThreadCount === "number"
-      ? `Unresolved threads: ${input.snapshot.unresolvedThreadCount}`
-      : null,
-    diff ? `Diff:\n${diff}` : null,
-    "Return concise GitHub review feedback. Do not approve; provide comment-ready feedback text.",
-  ]
-    .filter((value): value is string => Boolean(value))
-    .join("\n\n");
+  return appendCompletionInstruction(
+    [
+      `Review pull request ${input.repo}#${input.prNumber}.`,
+      input.snapshot.title ? `Title: ${input.snapshot.title}` : null,
+      input.snapshot.body ? `Body:\n${input.snapshot.body}` : null,
+      input.detail?.author ? `Author: ${input.detail.author}` : null,
+      `Head SHA: ${input.snapshot.headSha}`,
+      input.snapshot.checksSummary
+        ? `Checks: ${input.snapshot.checksSummary}`
+        : null,
+      typeof input.snapshot.unresolvedThreadCount === "number"
+        ? `Unresolved threads: ${input.snapshot.unresolvedThreadCount}`
+        : null,
+      diff ? `Diff:\n${diff}` : null,
+      "Return concise GitHub review feedback. Do not approve; provide comment-ready feedback text.",
+    ]
+      .filter((value): value is string => Boolean(value))
+      .join("\n\n"),
+  );
 }

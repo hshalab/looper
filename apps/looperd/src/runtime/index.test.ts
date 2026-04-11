@@ -50,6 +50,7 @@ class FakeGitHubGateway {
   public submitCalls: Array<{ repo: string; prNumber: number; event: string }> =
     [];
   public createPullRequestCalls = 0;
+  public resolvedThreadIds: string[] = [];
   private fixerViewIndex = 0;
 
   public async listOpenPullRequests() {
@@ -153,11 +154,21 @@ class FakeGitHubGateway {
       url: "https://example.test/pr/101",
     };
   }
+
+  public async resolveReviewThread(input: {
+    repo: string;
+    threadId: string;
+    cwd?: string;
+  }): Promise<void> {
+    this.resolvedThreadIds.push(input.threadId);
+  }
 }
 
 class FakeGitGateway {
   public pushCalls = 0;
   public createWorktreeCalls = 0;
+  public commitCalls = 0;
+  public cleanupCalls = 0;
 
   public async detectGitHubRepo(): Promise<string | null> {
     return "powerformer/looper";
@@ -165,6 +176,36 @@ class FakeGitGateway {
 
   public async push(): Promise<void> {
     this.pushCalls += 1;
+  }
+
+  public async prepareWorktree(): Promise<{
+    headSha?: string;
+    clean: boolean;
+  }> {
+    return { headSha: "abc123", clean: true };
+  }
+
+  public async inspectHead(): Promise<{
+    headSha?: string;
+    newCommitShas: string[];
+    hasUncommittedChanges: boolean;
+    changedFiles: string[];
+  }> {
+    return {
+      headSha: "commit-1",
+      newCommitShas: ["commit-1"],
+      hasUncommittedChanges: false,
+      changedFiles: [],
+    };
+  }
+
+  public async commit(): Promise<{ commitSha: string }> {
+    this.commitCalls += 1;
+    return { commitSha: "commit-1" };
+  }
+
+  public async cleanupWorktree(): Promise<void> {
+    this.cleanupCalls += 1;
   }
 
   public async createWorktree(input: {

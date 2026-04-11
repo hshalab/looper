@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentConfig, AgentVendor } from "../config/index";
 import type { Store } from "../storage/store";
 import type { AgentExecutionRecord } from "../storage/types";
+import { AGENT_COMPLETION_MARKER } from "./agent-prompt";
 
 export interface AgentRunInput {
   executionId?: string;
@@ -57,7 +58,12 @@ export interface AgentExecutorOptions {
 
 type ConfiguredAgentConfig = AgentConfig & { vendor: AgentVendor };
 
-const COMPLETION_MARKER = "__LOOPER_RESULT__=";
+export interface ResolvedAgentSpawn {
+  command: string;
+  args: string[];
+}
+
+const COMPLETION_MARKER = `${AGENT_COMPLETION_MARKER}=`;
 
 export class ConfiguredAgentExecutor {
   private readonly now: () => Date;
@@ -69,8 +75,10 @@ export class ConfiguredAgentExecutor {
   public async start(input: AgentRunInput): Promise<AgentExecution> {
     const executionId = input.executionId ?? randomUUID();
     const startedAtIso = this.now().toISOString();
-    const command = resolveCommand(this.options.config);
-    const args = resolveArgs(this.options.config);
+    const { command, args } = resolveAgentSpawn(
+      this.options.config,
+      input.prompt,
+    );
     const env = {
       ...this.options.config.env,
       ...input.env,
@@ -340,6 +348,16 @@ export class ConfiguredAgentExecutor {
   }
 }
 
+export function resolveAgentSpawn(
+  config: ConfiguredAgentConfig,
+  prompt: string,
+): ResolvedAgentSpawn {
+  return {
+    command: resolveCommand(config),
+    args: resolveArgs(config, prompt),
+  };
+}
+
 function resolveCommand(config: ConfiguredAgentConfig): string {
   const override = config.params?.command;
   if (typeof override === "string" && override.length > 0) {
@@ -350,17 +368,109 @@ function resolveCommand(config: ConfiguredAgentConfig): string {
     case "claude-code":
       return "claude";
     case "cursor-cli":
-      return "cursor-agent";
+      return "agent";
     default:
       return config.vendor;
   }
 }
 
-function resolveArgs(config: ConfiguredAgentConfig): string[] {
+function resolveArgs(config: ConfiguredAgentConfig, prompt: string): string[] {
   const args = config.params?.args;
-  return Array.isArray(args)
+  const resolvedArgs = Array.isArray(args)
     ? args.filter((value): value is string => typeof value === "string")
     : [];
+
+  switch (config.vendor) {
+    case "claude-code":
+      return resolveClaudeArgs(config, resolvedArgs, prompt);
+    case "codex":
+      return resolveCodexArgs(config, resolvedArgs, prompt);
+    case "opencode":
+      return resolveOpenCodeArgs(config, resolvedArgs, prompt);
+    case "cursor-cli":
+      return resolveCursorArgs(config, resolvedArgs, prompt);
+  }
+}
+
+function resolveClaudeArgs(
+  config: ConfiguredAgentConfig,
+  args: string[],
+  prompt: string,
+): string[] {
+  const resolved = prependModelFlag(args, config.model, "--model", ["--model"]);
+  if (hasAnyFlag(resolved, ["-p", "--print"])) {
+    return resolved;
+  }
+
+  return [...resolved, "--print", prompt];
+}
+
+function resolveCodexArgs(
+  config: ConfiguredAgentConfig,
+  args: string[],
+  prompt: string,
+): string[] {
+  const resolved = args.includes("exec") ? [...args] : ["exec", ...args];
+  const withModel = prependModelFlag(resolved, config.model, "--model", [
+    "--model",
+    "-m",
+  ]);
+  if (withModel.includes("-")) {
+    return withModel;
+  }
+
+  return [...withModel, prompt];
+}
+
+function resolveOpenCodeArgs(
+  config: ConfiguredAgentConfig,
+  args: string[],
+  prompt: string,
+): string[] {
+  const resolved = args.includes("run") ? [...args] : ["run", ...args];
+  const withModel = prependModelFlag(resolved, config.model, "--model", [
+    "--model",
+    "-m",
+  ]);
+  if (hasAnyFlag(withModel, ["-p", "--prompt", "-f", "--file"])) {
+    return withModel;
+  }
+
+  return [...withModel, prompt];
+}
+
+function resolveCursorArgs(
+  config: ConfiguredAgentConfig,
+  args: string[],
+  prompt: string,
+): string[] {
+  const resolved = prependModelFlag(args, config.model, "--model", ["--model"]);
+  if (hasAnyFlag(resolved, ["-p", "--print"])) {
+    return resolved;
+  }
+
+  return [...resolved, "--print", prompt];
+}
+
+function prependModelFlag(
+  args: string[],
+  model: string | undefined,
+  flag: string,
+  recognizedFlags: string[],
+): string[] {
+  if (!model || hasAnyFlag(args, recognizedFlags)) {
+    return [...args];
+  }
+
+  if (args[0] === "exec" || args[0] === "run") {
+    return [args[0], flag, model, ...args.slice(1)];
+  }
+
+  return [flag, model, ...args];
+}
+
+function hasAnyFlag(args: string[], flags: string[]): boolean {
+  return flags.some((flag) => args.includes(flag));
 }
 
 function appendBounded(

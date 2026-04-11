@@ -53,6 +53,13 @@ export interface CreatePullRequestResult {
   url: string;
 }
 
+export class ReviewThreadNotFoundError extends Error {
+  constructor(threadId: string) {
+    super(`Review thread not found: ${threadId}`);
+    this.name = "ReviewThreadNotFoundError";
+  }
+}
+
 export class GhCliGitHubGateway {
   private readonly now: () => Date;
 
@@ -141,6 +148,7 @@ export class GhCliGitHubGateway {
       input.cwd,
     );
     const parsed = asObject(result.stdout);
+    const reviewThreads = await this.fetchReviewThreads(input);
 
     return {
       number: Number(parsed.number),
@@ -156,10 +164,60 @@ export class GhCliGitHubGateway {
       baseSha: asOptionalString(parsed.baseRefOid),
       author: extractAuthor(parsed.author),
       reviewRequests: extractReviewRequestLogins(parsed.reviewRequests),
-      comments: asArrayValue(parsed.comments),
+      comments:
+        reviewThreads.length > 0
+          ? reviewThreads
+          : asArrayValue(parsed.comments),
       reviews: asArrayValue(parsed.reviews),
       checks: asArrayValue(parsed.statusCheckRollup),
     };
+  }
+
+  public async resolveReviewThread(input: {
+    repo: string;
+    threadId: string;
+    cwd?: string;
+  }): Promise<void> {
+    const thread = await this.getReviewThread({
+      repo: input.repo,
+      threadId: input.threadId,
+      cwd: input.cwd,
+    });
+    if (!thread) {
+      throw new ReviewThreadNotFoundError(input.threadId);
+    }
+    if (thread.isResolved) {
+      return;
+    }
+
+    const result = await this.runGh(
+      [
+        "api",
+        "graphql",
+        "-f",
+        `query=${[
+          "mutation($threadId: ID!) {",
+          "  resolveReviewThread(input: { threadId: $threadId }) {",
+          "    thread { id isResolved }",
+          "  }",
+          "}",
+        ].join("\n")}`,
+        "-F",
+        `threadId=${input.threadId}`,
+      ],
+      input.cwd,
+    );
+    const payload = asObject(result.stdout);
+    const resolved = payload.data as Record<string, unknown> | undefined;
+    const threadData = resolved?.resolveReviewThread as
+      | Record<string, unknown>
+      | undefined;
+    const threadNode = threadData?.thread as
+      | Record<string, unknown>
+      | undefined;
+    if (!threadNode || threadNode.isResolved !== true) {
+      throw new Error(`Failed to resolve review thread ${input.threadId}`);
+    }
   }
 
   public async getPullRequestDiff(input: {
@@ -268,6 +326,98 @@ export class GhCliGitHubGateway {
     };
   }
 
+  private async fetchReviewThreads(input: {
+    repo: string;
+    prNumber: number;
+    cwd?: string;
+  }): Promise<ReviewThreadComment[]> {
+    const { owner, name } = parseRepo(input.repo);
+    const result = await this.runGh(
+      [
+        "api",
+        "graphql",
+        "-f",
+        `query=${[
+          "query($owner: String!, $name: String!, $prNumber: Int!) {",
+          "  repository(owner: $owner, name: $name) {",
+          "    pullRequest(number: $prNumber) {",
+          "      reviewThreads(first: 100) {",
+          "        nodes {",
+          "          id",
+          "          isResolved",
+          "          comments(first: 1) {",
+          "            nodes { id body }",
+          "          }",
+          "        }",
+          "      }",
+          "    }",
+          "  }",
+          "}",
+        ].join("\n")}`,
+        "-F",
+        `owner=${owner}`,
+        "-F",
+        `name=${name}`,
+        "-F",
+        `prNumber=${input.prNumber}`,
+      ],
+      input.cwd,
+    );
+
+    const payload = asObject(result.stdout);
+    const repository = (payload.data as Record<string, unknown> | undefined)
+      ?.repository as Record<string, unknown> | undefined;
+    const pullRequest = repository?.pullRequest as
+      | Record<string, unknown>
+      | undefined;
+    const reviewThreads = pullRequest?.reviewThreads as
+      | Record<string, unknown>
+      | undefined;
+    return asArrayValue(reviewThreads?.nodes)
+      .map((node) => normalizeReviewThread(node))
+      .filter((value): value is ReviewThreadComment => Boolean(value));
+  }
+
+  private async getReviewThread(input: {
+    repo: string;
+    threadId: string;
+    cwd?: string;
+  }): Promise<ReviewThreadNode | null> {
+    const result = await this.runGh(
+      [
+        "api",
+        "graphql",
+        "-f",
+        `query=${[
+          "query($threadId: ID!) {",
+          "  node(id: $threadId) {",
+          "    ... on PullRequestReviewThread {",
+          "      id",
+          "      isResolved",
+          "    }",
+          "  }",
+          "}",
+        ].join("\n")}`,
+        "-F",
+        `threadId=${input.threadId}`,
+      ],
+      input.cwd,
+    );
+    const payload = asObject(result.stdout);
+    const node = (payload.data as Record<string, unknown> | undefined)?.node as
+      | Record<string, unknown>
+      | undefined;
+    const id = asOptionalString(node?.id);
+    if (!id) {
+      return null;
+    }
+
+    return {
+      id,
+      isResolved: node?.isResolved === true,
+    };
+  }
+
   private async runGh(args: string[], cwd?: string) {
     return runCommand({
       command: this.options.ghPath,
@@ -275,6 +425,19 @@ export class GhCliGitHubGateway {
       cwd: cwd ?? this.options.cwd,
     });
   }
+}
+
+interface ReviewThreadNode {
+  id: string;
+  isResolved: boolean;
+}
+
+interface ReviewThreadComment {
+  id: string;
+  threadId: string;
+  state: "RESOLVED" | "UNRESOLVED";
+  isResolved: boolean;
+  body?: string;
 }
 
 function summarizeChecks(checks: unknown[]): string | null {
@@ -302,6 +465,40 @@ function countUnresolvedThreads(comments: unknown[]): number {
     );
     return state !== "RESOLVED" && state !== "true";
   }).length;
+}
+
+function normalizeReviewThread(value: unknown): ReviewThreadComment | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const row = value as Record<string, unknown>;
+  const threadId = asOptionalString(row.id);
+  if (!threadId) {
+    return null;
+  }
+
+  const commentNode = asArrayValue(
+    (row.comments as Record<string, unknown> | undefined)?.nodes,
+  )[0] as Record<string, unknown> | undefined;
+  const commentId = asOptionalString(commentNode?.id) ?? threadId;
+  const isResolved = row.isResolved === true;
+
+  return {
+    id: commentId,
+    threadId,
+    state: isResolved ? "RESOLVED" : "UNRESOLVED",
+    isResolved,
+    body: asOptionalString(commentNode?.body),
+  };
+}
+
+function parseRepo(repo: string): { owner: string; name: string } {
+  const [owner, name] = repo.split("/");
+  if (!owner || !name) {
+    throw new Error(`Invalid GitHub repo: ${repo}`);
+  }
+  return { owner, name };
 }
 
 function asObject(value: string): Record<string, unknown> {

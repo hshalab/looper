@@ -39,14 +39,25 @@ describe("GitWorktreeGateway", () => {
     cleanupPaths.push(rootDir);
     const repoPath = join(rootDir, "repo");
     const worktreeRoot = join(rootDir, "worktrees");
+    const remotePath = join(rootDir, "remote.git");
     await mkdir(repoPath, { recursive: true });
+    await mkdir(remotePath, { recursive: true });
 
     await runGit(["init", "-b", "main"], repoPath);
+    await runGit(["init", "--bare"], remotePath);
     await runGit(["config", "user.email", "test@example.com"], repoPath);
     await runGit(["config", "user.name", "Looper Test"], repoPath);
+    await runGit(["remote", "add", "origin", remotePath], repoPath);
     await writeFile(join(repoPath, "README.md"), "hello\n");
     await runGit(["add", "README.md"], repoPath);
     await runGit(["commit", "-m", "init"], repoPath);
+    await runGit(["push", "-u", "origin", "main"], repoPath);
+    await runGit(["checkout", "-b", "feature/fixer"], repoPath);
+    await writeFile(join(repoPath, "fix.txt"), "remote change\n");
+    await runGit(["add", "fix.txt"], repoPath);
+    await runGit(["commit", "-m", "feature"], repoPath);
+    await runGit(["push", "-u", "origin", "feature/fixer"], repoPath);
+    await runGit(["checkout", "main"], repoPath);
 
     const store = new SqliteStore({
       dbPath: join(rootDir, "state", "looper.sqlite"),
@@ -69,29 +80,69 @@ describe("GitWorktreeGateway", () => {
       projectId: "project_1",
       repoPath,
       worktreeRoot,
-      branch: "task/123",
+      branch: "feature/fixer",
       baseBranch: "main",
+      prNumber: 42,
     });
     const restored = await gateway.restoreWorktree({
       projectId: "project_1",
       repoPath,
-      branch: "task/123",
+      branch: "feature/fixer",
+    });
+    const prepared = await gateway.prepareWorktree({
+      worktreePath: worktree.worktreePath,
+      branch: "feature/fixer",
+    });
+
+    await writeFile(
+      join(worktree.worktreePath, "README.md"),
+      "hello updated\n",
+    );
+    const inspectBeforeCommit = await gateway.inspectHead({
+      worktreePath: worktree.worktreePath,
+      baseRef: prepared.headSha,
+    });
+    const globalEmailBefore = (
+      await runGit(
+        ["config", "--global", "--get", "user.email"],
+        repoPath,
+      ).catch(() => "")
+    ).trim();
+    const commit = await gateway.commit({
+      worktreePath: worktree.worktreePath,
+      message: "fixer: address PR #42 follow-up items",
+    });
+    const inspectAfterCommit = await gateway.inspectHead({
+      worktreePath: worktree.worktreePath,
+      baseRef: prepared.headSha,
     });
 
     expect(
       await readFile(join(worktree.worktreePath, "README.md"), "utf8"),
-    ).toContain("hello");
-    expect(restored?.branch).toBe("task/123");
+    ).toContain("updated");
+    expect(restored?.branch).toBe("feature/fixer");
+    expect(prepared.clean).toBe(true);
+    expect(inspectBeforeCommit.hasUncommittedChanges).toBe(true);
+    expect(commit.commitSha).toBeTruthy();
+    expect(inspectAfterCommit.hasUncommittedChanges).toBe(false);
+    expect(inspectAfterCommit.newCommitShas).toHaveLength(1);
+    const globalEmailAfter = (
+      await runGit(
+        ["config", "--global", "--get", "user.email"],
+        repoPath,
+      ).catch(() => "")
+    ).trim();
+    expect(globalEmailAfter).toBe(globalEmailBefore);
 
     await gateway.cleanupWorktree({
       projectId: "project_1",
       repoPath,
       worktreePath: worktree.worktreePath,
-      branch: "task/123",
+      branch: "feature/fixer",
     });
-    expect(store.worktrees.getByBranch("project_1", "task/123")?.status).toBe(
-      "cleaned",
-    );
+    expect(
+      store.worktrees.getByBranch("project_1", "feature/fixer")?.status,
+    ).toBe("cleaned");
     expect(() => gateway.assertWritableBranch("main", ["main"])).toThrow(
       ProtectedBranchError,
     );

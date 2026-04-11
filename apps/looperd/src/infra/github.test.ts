@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { GhCliGitHubGateway } from "./github";
+import { GhCliGitHubGateway, ReviewThreadNotFoundError } from "./github";
 
 const cleanupPaths: string[] = [];
 
@@ -29,6 +29,9 @@ describe("GhCliGitHubGateway", () => {
 elif [ "$1" = "pr" ] && [ "$2" = "view" ]; then\n  printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}'
 elif [ "$1" = "pr" ] && [ "$2" = "diff" ]; then\n  printf 'diff --git a/a.ts b/a.ts\n'
 elif [ "$1" = "api" ] && [ "$2" = "user" ]; then\n  printf 'reviewer\n'
+elif [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'reviewThreads'; then\n  printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"comments":{"nodes":[{"id":"comment-1","body":"Fix this"}]}}]}}}}}'
+elif [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'node(id:'; then\n  printf '{"data":{"node":{"id":"thread-1","isResolved":false}}}'
+elif [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'resolveReviewThread'; then\n  printf '{"data":{"resolveReviewThread":{"thread":{"id":"thread-1","isResolved":true}}}}'
 else\n  exit 0\nfi\n`,
     );
     await chmod(scriptPath, 0o755);
@@ -49,6 +52,10 @@ else\n  exit 0\nfi\n`,
       event: "COMMENT",
       body: "Looks good",
     });
+    await gateway.resolveReviewThread({
+      repo: "acme/looper",
+      threadId: "thread-1",
+    });
 
     expect(prs[0]?.number).toBe(42);
     expect(prs[0]?.reviewRequests).toEqual(["OctoCat"]);
@@ -59,11 +66,84 @@ else\n  exit 0\nfi\n`,
       prNumber: 42,
     });
     expect(detail.reviewRequests).toEqual(["reviewer"]);
+    expect(detail.comments).toEqual([
+      {
+        id: "comment-1",
+        threadId: "thread-1",
+        state: "UNRESOLVED",
+        isResolved: false,
+        body: "Fix this",
+      },
+    ]);
     await expect(gateway.getCurrentUserLogin()).resolves.toBe("reviewer");
 
     const log = await readFile(logPath, "utf8");
     expect(log).toContain(
       "pr review 42 --repo acme/looper --comment --body Looks good",
     );
+    expect(log).toContain("threadId=thread-1");
+  });
+
+  test("treats missing review thread as not found", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-gh-"));
+    cleanupPaths.push(rootDir);
+
+    const scriptPath = join(rootDir, "gh");
+    await writeFile(
+      scriptPath,
+      `#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'node(id:'; then
+  printf '{"data":{"node":null}}'
+else
+  printf '{}'
+fi
+`,
+    );
+    await chmod(scriptPath, 0o755);
+
+    const gateway = new GhCliGitHubGateway({
+      ghPath: scriptPath,
+      cwd: rootDir,
+    });
+
+    await expect(
+      gateway.resolveReviewThread({
+        repo: "acme/looper",
+        threadId: "thread-missing",
+      }),
+    ).rejects.toBeInstanceOf(ReviewThreadNotFoundError);
+  });
+
+  test("surfaces permission errors when resolving review thread", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "looper-gh-"));
+    cleanupPaths.push(rootDir);
+
+    const scriptPath = join(rootDir, "gh");
+    await writeFile(
+      scriptPath,
+      `#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'node(id:'; then
+  printf '{"data":{"node":{"id":"thread-1","isResolved":false}}}'
+elif [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'resolveReviewThread'; then
+  printf 'permission denied' >&2
+  exit 1
+else
+  printf '{}'
+fi
+`,
+    );
+    await chmod(scriptPath, 0o755);
+
+    const gateway = new GhCliGitHubGateway({
+      ghPath: scriptPath,
+      cwd: rootDir,
+    });
+
+    await expect(
+      gateway.resolveReviewThread({
+        repo: "acme/looper",
+        threadId: "thread-1",
+      }),
+    ).rejects.toThrow("Command exited with code 1");
   });
 });

@@ -18,13 +18,13 @@ import { ReviewerLoopRunner } from "../reviewer/index";
 import { SchedulerQueue } from "../scheduler/index";
 import { type LooperdApiServer, createLooperdApiServer } from "../server/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
-import { WorkerLoopRunner } from "../worker/index";
 import type {
   AgentExecutionRecord,
   EventLogRecord,
   LoopRecord,
   RunRecord,
 } from "../storage/types";
+import { WorkerLoopRunner } from "../worker/index";
 
 interface RuntimeAgentExecution {
   wait(): Promise<AgentResult>;
@@ -65,13 +65,20 @@ export interface CreateLooperdRuntimeOptions {
     | "listOpenPullRequests"
     | "getCurrentUserLogin"
     | "viewPullRequest"
+    | "resolveReviewThread"
     | "capturePullRequestSnapshot"
     | "submitReview"
     | "createPullRequest"
   >;
   git?: Pick<
     GitWorktreeGateway,
-    "detectGitHubRepo" | "push" | "createWorktree"
+    | "detectGitHubRepo"
+    | "push"
+    | "createWorktree"
+    | "prepareWorktree"
+    | "inspectHead"
+    | "commit"
+    | "cleanupWorktree"
   >;
   agentExecutor?: RuntimeAgentExecutor;
   enableReviewer?: boolean;

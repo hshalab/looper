@@ -3,8 +3,8 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { AgentResult, AgentRunInput } from "../infra/agent";
 import type { Logger } from "../bootstrap/logger";
+import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import {
@@ -63,6 +63,7 @@ async function createFixture() {
 
 class FakeGitHubGateway implements FixerGitHubGateway {
   public viewCalls = 0;
+  public resolvedThreadIds: string[] = [];
 
   constructor(
     private readonly options: {
@@ -70,6 +71,7 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       views: Array<
         "error" | { comments?: unknown[]; checks?: unknown[]; headSha?: string }
       >;
+      resolveFailures?: Record<string, string>;
     },
   ) {}
 
@@ -121,18 +123,112 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       checks: next.checks ?? [],
     };
   }
+
+  public async resolveReviewThread(input: {
+    repo: string;
+    threadId: string;
+    cwd?: string;
+  }) {
+    const failure = this.options.resolveFailures?.[input.threadId];
+    if (failure) {
+      throw new Error(failure);
+    }
+    this.resolvedThreadIds.push(input.threadId);
+  }
 }
 
 class FakeGitGateway implements FixerGitGateway {
   public pushCalls = 0;
+  public createWorktreeCalls = 0;
+  public prepareCalls = 0;
+  public commitCalls = 0;
+  public cleanupCalls = 0;
+
+  constructor(
+    private readonly options: {
+      worktreePath?: string;
+      prepareResult?: { headSha?: string; clean: boolean };
+      inspectResults?: Array<{
+        headSha?: string;
+        newCommitShas: string[];
+        hasUncommittedChanges: boolean;
+        changedFiles: string[];
+      }>;
+      commitSha?: string;
+      pushError?: string;
+    } = {},
+  ) {}
+
+  public async createWorktree(_input: {
+    projectId: string;
+    repoPath: string;
+    worktreeRoot: string;
+    branch: string;
+    baseBranch: string;
+    prNumber: number;
+    protectedBranches?: string[];
+  }) {
+    this.createWorktreeCalls += 1;
+    return {
+      worktreePath: this.options.worktreePath ?? "/tmp/looper-fixer-worktree",
+      branch: _input.branch,
+      headSha: this.options.prepareResult?.headSha ?? "abc123",
+    };
+  }
+
+  public async prepareWorktree(_input: {
+    worktreePath: string;
+    branch: string;
+    expectedHeadSha?: string;
+    remote?: string;
+  }) {
+    this.prepareCalls += 1;
+    return (
+      this.options.prepareResult ?? {
+        headSha: _input.expectedHeadSha ?? "abc123",
+        clean: true,
+      }
+    );
+  }
+
+  public async inspectHead(_input: { worktreePath: string; baseRef?: string }) {
+    const next = this.options.inspectResults?.shift();
+    return (
+      next ?? {
+        headSha: "commit-1",
+        newCommitShas: ["commit-1"],
+        hasUncommittedChanges: false,
+        changedFiles: [],
+      }
+    );
+  }
+
+  public async commit(_input: { worktreePath: string; message: string }) {
+    this.commitCalls += 1;
+    return { commitSha: this.options.commitSha ?? "looperd-commit-1" };
+  }
 
   public async push(_input: {
     worktreePath: string;
     branch: string;
     remote?: string;
+    expectedRemoteHeadSha?: string;
     protectedBranches?: string[];
   }): Promise<void> {
+    if (this.options.pushError) {
+      throw new Error(this.options.pushError);
+    }
     this.pushCalls += 1;
+  }
+
+  public async cleanupWorktree(_input: {
+    projectId: string;
+    repoPath: string;
+    worktreePath: string;
+    branch: string;
+    protectedBranches?: string[];
+  }): Promise<void> {
+    this.cleanupCalls += 1;
   }
 }
 
@@ -190,8 +286,26 @@ describe("FixerLoopRunner", () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
       views: [
-        { comments: [{ id: "c1", state: "UNRESOLVED", body: "needs fix" }] },
-        { comments: [{ id: "c1", state: "UNRESOLVED", body: "needs fix" }] },
+        {
+          comments: [
+            {
+              id: "c1",
+              threadId: "thread-1",
+              state: "UNRESOLVED",
+              body: "needs fix",
+            },
+          ],
+        },
+        {
+          comments: [
+            {
+              id: "c1",
+              threadId: "thread-1",
+              state: "UNRESOLVED",
+              body: "needs fix",
+            },
+          ],
+        },
         { comments: [], checks: [] },
       ],
     });
@@ -224,12 +338,22 @@ describe("FixerLoopRunner", () => {
     }
 
     const result = await runner.processClaimedItem(claimed);
-    expect(result.status).toBe("success");
+    if (result.status !== "success") {
+      throw new Error(
+        `${result.failureKind ?? result.status}: ${result.summary}`,
+      );
+    }
     expect(agent.starts).toHaveLength(1);
+    expect(git.createWorktreeCalls).toBe(1);
     expect(git.pushCalls).toBe(1);
+    expect(github.resolvedThreadIds).toEqual(["thread-1"]);
+    expect(git.cleanupCalls).toBe(1);
     const run = fixture.store.runs.listByLoop(result.loopId)[0];
     const checkpoint = JSON.parse(run?.checkpointJson ?? "{}");
     expect(checkpoint.recheck.remainingFixItems).toHaveLength(0);
+    expect(checkpoint.worktree.path).toBeTruthy();
+    expect(checkpoint.reconcileCommits.finalHeadSha).toBe("commit-1");
+    expect(checkpoint.resolvedComments.items).toHaveLength(1);
     expect(
       logs.entries.some((entry) => entry.message === "fixer loop started"),
     ).toBe(true);
@@ -253,8 +377,26 @@ describe("FixerLoopRunner", () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
       views: [
-        { comments: [{ id: "c1", state: "UNRESOLVED", body: "needs fix" }] },
-        { comments: [{ id: "c1", state: "UNRESOLVED", body: "needs fix" }] },
+        {
+          comments: [
+            {
+              id: "c1",
+              threadId: "thread-1",
+              state: "UNRESOLVED",
+              body: "needs fix",
+            },
+          ],
+        },
+        {
+          comments: [
+            {
+              id: "c1",
+              threadId: "thread-1",
+              state: "UNRESOLVED",
+              body: "needs fix",
+            },
+          ],
+        },
         "error",
         { comments: [], checks: [] },
       ],
@@ -372,8 +514,14 @@ describe("FixerLoopRunner", () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
       views: [
-        { comments: [{ id: "c1", state: "UNRESOLVED" }], checks: [] },
-        { comments: [{ id: "c1", state: "UNRESOLVED" }], checks: [] },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
         { comments: [], checks: [] },
       ],
     });
@@ -411,6 +559,9 @@ describe("FixerLoopRunner", () => {
     expect(eventTypes).toContain("run.started");
     expect(eventTypes).toContain("loop.step.started");
     expect(eventTypes).toContain("loop.step.completed");
+    expect(eventTypes).toContain("fixer.worktree.prepared");
+    expect(eventTypes).toContain("fixer.commits.reconciled");
+    expect(eventTypes).toContain("fixer.comments.resolved");
     expect(eventTypes).toContain("pr.branch.pushed");
 
     fixture.store.close();
@@ -420,8 +571,14 @@ describe("FixerLoopRunner", () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
       views: [
-        { comments: [{ id: "c1", state: "UNRESOLVED" }], checks: [] },
-        { comments: [{ id: "c1", state: "UNRESOLVED" }], checks: [] },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
       ],
     });
     const git = new FakeGitGateway();
@@ -454,19 +611,39 @@ describe("FixerLoopRunner", () => {
     expect(result.status).toBe("skipped");
     expect(result.summary).toContain("Auto push disabled");
     expect(git.pushCalls).toBe(0);
+    expect(
+      fixture.store.events
+        .list()
+        .some((event) => event.eventType === "fixer.push.skipped"),
+    ).toBe(true);
 
     fixture.store.close();
   });
 
-  test("skips agent execution when auto commit is disabled", async () => {
+  test("fails after repair when auto commit is disabled and worktree is dirty", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
       views: [
-        { comments: [{ id: "c1", state: "UNRESOLVED" }], checks: [] },
-        { comments: [{ id: "c1", state: "UNRESOLVED" }], checks: [] },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
       ],
     });
-    const git = new FakeGitGateway();
+    const git = new FakeGitGateway({
+      inspectResults: [
+        {
+          headSha: "abc123",
+          newCommitShas: [],
+          hasUncommittedChanges: true,
+          changedFiles: ["apps/looperd/src/fixer/index.ts"],
+        },
+      ],
+    });
     const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
     const runner = new FixerLoopRunner({
       store: fixture.store,
@@ -493,10 +670,142 @@ describe("FixerLoopRunner", () => {
     }
 
     const result = await runner.processClaimedItem(claimed);
-    expect(result.status).toBe("skipped");
+    expect(result.status).toBe("failed");
+    expect(result.failureKind).toBe("manual_intervention");
     expect(result.summary).toContain("Auto commit disabled");
-    expect(agent.starts).toHaveLength(0);
+    expect(agent.starts).toHaveLength(1);
     expect(git.pushCalls).toBe(0);
+
+    fixture.store.close();
+  });
+
+  test("allows one extra reconcile pass when validation generates changes", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      views: [
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
+        { comments: [], checks: [] },
+      ],
+    });
+    const git = new FakeGitGateway({
+      inspectResults: [
+        {
+          headSha: "agent-commit",
+          newCommitShas: ["agent-commit"],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "agent-commit",
+          newCommitShas: ["agent-commit"],
+          hasUncommittedChanges: true,
+          changedFiles: ["generated.txt"],
+        },
+        {
+          headSha: "agent-commit",
+          newCommitShas: ["agent-commit"],
+          hasUncommittedChanges: true,
+          changedFiles: ["generated.txt"],
+        },
+        {
+          headSha: "looperd-commit-2",
+          newCommitShas: ["agent-commit", "looperd-commit-2"],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+        {
+          headSha: "looperd-commit-2",
+          newCommitShas: ["agent-commit", "looperd-commit-2"],
+          hasUncommittedChanges: false,
+          changedFiles: [],
+        },
+      ],
+      commitSha: "looperd-commit-2",
+    });
+    let validationCalls = 0;
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      git,
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("fixed")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => {
+        validationCalls += 1;
+        return { passed: true, summary: `ok-${validationCalls}` };
+      },
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("fixer-1");
+    if (!claimed) throw new Error("Expected claimed fixer queue item");
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(validationCalls).toBe(2);
+
+    fixture.store.close();
+  });
+
+  test("fails safely when remote head changed before push", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      views: [
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+        },
+      ],
+    });
+    const git = new FakeGitGateway({
+      pushError: "Remote head changed for feature/fixer",
+    });
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      git,
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("fixed")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+      }),
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("fixer-1");
+    if (!claimed) throw new Error("Expected claimed fixer queue item");
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("failed");
+    expect(result.failureKind).toBe("retryable_after_resume");
+    expect(result.summary).toContain("Remote head changed");
+    expect(git.cleanupCalls).toBe(0);
+    expect(
+      fixture.store.events
+        .list()
+        .some((event) => event.eventType === "fixer.push.conflicted"),
+    ).toBe(true);
 
     fixture.store.close();
   });

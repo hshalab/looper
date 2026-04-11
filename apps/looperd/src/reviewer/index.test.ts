@@ -3,8 +3,8 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { AgentResult, AgentRunInput } from "../infra/agent";
 import type { Logger } from "../bootstrap/logger";
+import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import type { PullRequestSnapshotRecord } from "../storage/types";

@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
+import type { Logger } from "../bootstrap/logger";
 import type { OpenPrStrategy } from "../config/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
-import type { Logger } from "../bootstrap/logger";
+import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
 import { ProtectedBranchError } from "../infra/git";
 import type { SchedulerQueue } from "../scheduler/index";
@@ -1312,20 +1313,22 @@ async function buildWorkerPrompt(input: {
     input.projectRepoPath,
     input.task.specPath,
   );
-  return [
-    `Implement task ${input.task.id}: ${input.task.title}`,
-    input.task.description
-      ? `Task description:\n${input.task.description}`
-      : null,
-    `Repository: ${input.task.repo}`,
-    `Base branch: ${input.task.baseBranch}`,
-    specBlock,
-    "Checklist slice:",
-    ...input.items.map((item, index) => `${index + 1}. ${item.content}`),
-    "Work only on this checklist slice. Make the necessary code changes and stop when the slice is ready for validation.",
-  ]
-    .filter((value): value is string => Boolean(value))
-    .join("\n\n");
+  return appendCompletionInstruction(
+    [
+      `Implement task ${input.task.id}: ${input.task.title}`,
+      input.task.description
+        ? `Task description:\n${input.task.description}`
+        : null,
+      `Repository: ${input.task.repo}`,
+      `Base branch: ${input.task.baseBranch}`,
+      specBlock,
+      "Checklist slice:",
+      ...input.items.map((item, index) => `${index + 1}. ${item.content}`),
+      "Work only on this checklist slice. Make the necessary code changes and stop when the slice is ready for validation.",
+    ]
+      .filter((value): value is string => Boolean(value))
+      .join("\n\n"),
+  );
 }
 
 async function readSpecBlock(

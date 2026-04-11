@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { join } from "node:path";
 
-import type { AgentResult, AgentRunInput } from "../infra/agent";
 import type { Logger } from "../bootstrap/logger";
+import type { AgentResult, AgentRunInput } from "../infra/agent";
+import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
 import type {
   GitHubPullRequestDetail,
@@ -21,16 +23,19 @@ const FIXER_STEP_SEQUENCE = [
   "discover-pr",
   "claim-pr",
   "collect-fixes",
+  "prepare-worktree",
   "repair",
+  "reconcile-commits",
   "validate",
   "push",
+  "resolve-comments",
   "recheck",
 ] as const;
 
 export type FixerStep = (typeof FIXER_STEP_SEQUENCE)[number];
 
 export type FixItem =
-  | { type: "comment"; id: string; summary: string }
+  | { type: "comment"; id: string; threadId: string; summary: string }
   | { type: "check"; name: string; summary: string }
   | { type: "conflict"; files: string[] };
 
@@ -45,13 +50,58 @@ export interface FixerGitHubGateway {
     prNumber: number;
     cwd?: string;
   }): Promise<GitHubPullRequestDetail>;
+  resolveReviewThread(input: {
+    repo: string;
+    threadId: string;
+    cwd?: string;
+  }): Promise<void>;
 }
 
 export interface FixerGitGateway {
+  createWorktree(input: {
+    projectId: string;
+    repoPath: string;
+    worktreeRoot: string;
+    branch: string;
+    baseBranch: string;
+    prNumber: number;
+    protectedBranches?: string[];
+  }): Promise<{
+    worktreePath: string;
+    branch: string;
+    headSha?: string | null;
+  }>;
+  prepareWorktree(input: {
+    worktreePath: string;
+    branch: string;
+    expectedHeadSha?: string;
+    remote?: string;
+  }): Promise<{
+    headSha?: string;
+    clean: boolean;
+  }>;
+  inspectHead(input: { worktreePath: string; baseRef?: string }): Promise<{
+    headSha?: string;
+    newCommitShas: string[];
+    hasUncommittedChanges: boolean;
+    changedFiles: string[];
+  }>;
+  commit(input: {
+    worktreePath: string;
+    message: string;
+  }): Promise<{ commitSha: string }>;
   push(input: {
     worktreePath: string;
     branch: string;
     remote?: string;
+    expectedRemoteHeadSha?: string;
+    protectedBranches?: string[];
+  }): Promise<void>;
+  cleanupWorktree(input: {
+    projectId: string;
+    repoPath: string;
+    worktreePath: string;
+    branch: string;
     protectedBranches?: string[];
   }): Promise<void>;
 }
@@ -115,6 +165,7 @@ interface FixerCheckpoint {
     isDraft?: boolean;
     headSha?: string;
     headRefName?: string;
+    baseRefName?: string;
     baseSha?: string;
     reviewDecision?: string;
     comments?: unknown[];
@@ -124,15 +175,48 @@ interface FixerCheckpoint {
   claimedLockKey?: string;
   fixItems?: FixItem[];
   fixItemsHash?: string;
+  worktree?: {
+    path?: string;
+    branch?: string;
+    headSha?: string;
+    baseHeadSha?: string;
+    preparedAt?: string;
+    cleanupAttemptedAt?: string;
+    cleanedAt?: string;
+  };
   repair?: {
+    agentExecutionId?: string;
     summary?: string;
     headSha?: string;
+    parseStatus?: "parsed" | "missing" | "invalid_json";
+    completedAt?: string;
+  };
+  reconcileCommits?: {
+    baseHeadSha?: string;
+    finalHeadSha?: string;
+    newCommitShas: string[];
+    committedByAgent: boolean;
+    committedByLooperd: boolean;
+    workingTreeClean: boolean;
+    changedFiles?: string[];
+    completedAt?: string;
   };
   validation?: FixerValidationResult;
   push?: {
     pushed: boolean;
     branch: string;
-    pushedAt: string;
+    remote?: string;
+    pushedAt?: string;
+    skippedReason?: string;
+  };
+  resolvedComments?: {
+    items: Array<{
+      fixItemId: string;
+      threadId?: string;
+      status: "resolved" | "already_resolved" | "failed";
+      message?: string;
+      updatedAt: string;
+    }>;
   };
   recheck?: {
     remainingFixItems: FixItem[];
@@ -415,6 +499,10 @@ export class FixerLoopRunner {
         lastRunAt: this.nowIso(),
         nextRunAt: null,
       });
+      await this.cleanupFixerWorktreeIfTerminal({
+        checkpoint,
+        project,
+      });
 
       return {
         loopId: loop.id,
@@ -493,6 +581,10 @@ export class FixerLoopRunner {
           lastRunAt: this.nowIso(),
           nextRunAt: null,
         });
+        await this.cleanupFixerWorktreeIfTerminal({
+          checkpoint,
+          project,
+        });
       }
 
       return {
@@ -525,12 +617,18 @@ export class FixerLoopRunner {
         return this.runClaimPrStep(input);
       case "collect-fixes":
         return this.runCollectFixesStep(input);
+      case "prepare-worktree":
+        return this.runPrepareWorktreeStep(input);
       case "repair":
         return this.runRepairStep(input);
+      case "reconcile-commits":
+        return this.runReconcileCommitsStep(input);
       case "validate":
         return this.runValidateStep(input);
       case "push":
         return this.runPushStep(input);
+      case "resolve-comments":
+        return this.runResolveCommentsStep(input);
       case "recheck":
         return this.runRecheckStep(input);
     }
@@ -559,6 +657,7 @@ export class FixerLoopRunner {
         isDraft: detail.isDraft,
         headSha: detail.headSha,
         headRefName: detail.headRefName,
+        baseRefName: detail.baseRefName,
         baseSha: detail.baseSha,
         reviewDecision: detail.reviewDecision,
         comments: detail.comments,
@@ -635,9 +734,84 @@ export class FixerLoopRunner {
     };
   }
 
-  private async runRepairStep(input: {
+  private async runPrepareWorktreeStep(input: {
     checkpoint: FixerCheckpoint;
     project: ProjectRecord;
+    queueItem: QueueItemRecord;
+  }): Promise<FixerCheckpoint> {
+    if (input.checkpoint.skipReason) {
+      return input.checkpoint;
+    }
+    if (input.checkpoint.worktree?.preparedAt) {
+      return input.checkpoint;
+    }
+
+    const detail = input.checkpoint.detail;
+    const branch = requireString(detail?.headRefName, "detail.headRefName");
+    const prNumber = requireNumber(
+      input.queueItem.prNumber,
+      "queueItem.prNumber",
+    );
+    const projectMetadata = parseJsonObject(input.project.metadataJson);
+    const worktreeRoot =
+      readString(projectMetadata.worktreeRoot) ??
+      join(input.project.repoPath, ".looper-worktrees");
+    const worktree = await this.options.git.createWorktree({
+      projectId: input.project.id,
+      repoPath: input.project.repoPath,
+      worktreeRoot,
+      branch,
+      baseBranch: detail?.baseRefName ?? input.project.baseBranch ?? "main",
+      prNumber,
+      protectedBranches: compactStrings([
+        detail?.baseRefName,
+        input.project.baseBranch,
+      ]),
+    });
+    const prepared = await this.options.git.prepareWorktree({
+      worktreePath: worktree.worktreePath,
+      branch,
+      expectedHeadSha: detail?.headSha,
+    });
+    if (!prepared.clean) {
+      throw new FixerLoopError(
+        `Fixer worktree is dirty for branch ${branch}; manual intervention required`,
+        "manual_intervention",
+      );
+    }
+
+    const preparedAt = this.nowIso();
+    this.appendEvent({
+      eventType: "fixer.worktree.prepared",
+      projectId: input.project.id,
+      entityType: "pull_request",
+      entityId: buildPullRequestTargetId(
+        requireString(input.queueItem.repo, "queueItem.repo"),
+        prNumber,
+      ),
+      payload: {
+        branch,
+        path: worktree.worktreePath,
+        headSha: prepared.headSha ?? null,
+        preparedAt,
+      },
+    });
+
+    return {
+      ...input.checkpoint,
+      worktree: {
+        path: worktree.worktreePath,
+        branch,
+        headSha: prepared.headSha,
+        baseHeadSha: prepared.headSha,
+        preparedAt,
+      },
+      resumePolicy: "advance_from_checkpoint",
+    };
+  }
+
+  private async runRepairStep(input: {
+    checkpoint: FixerCheckpoint;
     loop: LoopRecord;
     run: RunRecord;
     queueItem: QueueItemRecord;
@@ -668,15 +842,9 @@ export class FixerLoopRunner {
       };
     }
 
-    if (!this.allowAutoCommit) {
-      return {
-        ...input.checkpoint,
-        skipReason: `Auto commit disabled; manual fixer execution required for ${input.queueItem.repo}#${input.queueItem.prNumber}`,
-        resumePolicy: "manual_intervention",
-      };
-    }
-
     const detail = input.checkpoint.detail;
+    const worktree = requireWorktree(input.checkpoint);
+    const executionId = randomUUID();
     const prompt = buildFixerPrompt({
       repo: requireString(input.queueItem.repo, "queueItem.repo"),
       prNumber: requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
@@ -684,12 +852,12 @@ export class FixerLoopRunner {
       fixItems,
     });
     const execution = await this.options.agentExecutor.start({
-      executionId: randomUUID(),
-      projectId: input.project.id,
+      executionId,
+      projectId: input.loop.projectId,
       loopId: input.loop.id,
       runId: input.run.id,
       prompt,
-      workingDirectory: input.project.repoPath,
+      workingDirectory: requireString(worktree.path, "worktree.path"),
       timeoutMs: this.agentTimeoutMs,
       metadata: {
         loopType: "fixer",
@@ -710,23 +878,60 @@ export class FixerLoopRunner {
     return {
       ...input.checkpoint,
       repair: {
+        agentExecutionId: executionId,
         summary: result.summary,
         headSha: detail?.headSha,
+        parseStatus: result.parseStatus,
+        completedAt: this.nowIso(),
       },
       resumePolicy: "advance_from_checkpoint",
     };
   }
 
-  private async runValidateStep(input: {
+  private async runReconcileCommitsStep(input: {
     checkpoint: FixerCheckpoint;
     project: ProjectRecord;
+    queueItem: QueueItemRecord;
+  }): Promise<FixerCheckpoint> {
+    if (input.checkpoint.skipReason) {
+      return input.checkpoint;
+    }
+    if (input.checkpoint.reconcileCommits?.completedAt) {
+      return input.checkpoint;
+    }
+
+    const checkpoint = await this.reconcileCommits({
+      checkpoint: input.checkpoint,
+      commitMessage: buildFixerCommitMessage(
+        requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
+      ),
+    });
+    this.appendEvent({
+      eventType: "fixer.commits.reconciled",
+      projectId: input.project.id,
+      entityType: "pull_request",
+      entityId: buildPullRequestTargetId(
+        requireString(input.queueItem.repo, "queueItem.repo"),
+        requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
+      ),
+      payload: checkpoint.reconcileCommits,
+    });
+    return checkpoint;
+  }
+
+  private async runValidateStep(input: {
+    checkpoint: FixerCheckpoint;
+    queueItem: QueueItemRecord;
   }): Promise<FixerCheckpoint> {
     if (input.checkpoint.skipReason) {
       return input.checkpoint;
     }
 
     const result = await this.runValidation({
-      cwd: input.project.repoPath,
+      cwd: requireString(
+        requireWorktree(input.checkpoint).path,
+        "worktree.path",
+      ),
       commands: this.validationCommands,
     });
     if (!result.passed) {
@@ -734,6 +939,63 @@ export class FixerLoopRunner {
         result.summary ?? "Validation failed",
         "retryable_after_resume",
       );
+    }
+
+    const inspect = await this.options.git.inspectHead({
+      worktreePath: requireString(
+        requireWorktree(input.checkpoint).path,
+        "worktree.path",
+      ),
+      baseRef: input.checkpoint.reconcileCommits?.baseHeadSha,
+    });
+    if (inspect.hasUncommittedChanges) {
+      if (input.checkpoint.validation?.summary?.includes("extra reconcile")) {
+        throw new FixerLoopError(
+          "Validation keeps producing new modifications after an extra reconcile pass",
+          "retryable_after_resume",
+        );
+      }
+
+      const reconciled = await this.reconcileCommits({
+        checkpoint: input.checkpoint,
+        commitMessage: buildFixerCommitMessage(
+          requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
+        ),
+      });
+      const secondResult = await this.runValidation({
+        cwd: requireString(requireWorktree(reconciled).path, "worktree.path"),
+        commands: this.validationCommands,
+      });
+      if (!secondResult.passed) {
+        throw new FixerLoopError(
+          secondResult.summary ?? "Validation failed after reconcile",
+          "retryable_after_resume",
+        );
+      }
+      const finalInspect = await this.options.git.inspectHead({
+        worktreePath: requireString(
+          requireWorktree(reconciled).path,
+          "worktree.path",
+        ),
+        baseRef: reconciled.reconcileCommits?.baseHeadSha,
+      });
+      if (finalInspect.hasUncommittedChanges) {
+        throw new FixerLoopError(
+          "Validation keeps producing new modifications after an extra reconcile pass",
+          "retryable_after_resume",
+        );
+      }
+
+      return {
+        ...reconciled,
+        validation: {
+          ...secondResult,
+          summary:
+            secondResult.summary ?? "Validation passed after extra reconcile",
+          output: secondResult.output,
+        },
+        resumePolicy: "advance_from_checkpoint",
+      };
     }
 
     return {
@@ -756,7 +1018,8 @@ export class FixerLoopRunner {
       return input.checkpoint;
     }
 
-    const branch = input.checkpoint.detail?.headRefName;
+    const worktree = requireWorktree(input.checkpoint);
+    const branch = worktree.branch ?? input.checkpoint.detail?.headRefName;
     if (!branch) {
       throw new FixerLoopError(
         "Missing PR head branch for push step",
@@ -765,6 +1028,20 @@ export class FixerLoopRunner {
     }
 
     if (!this.allowAutoPush) {
+      this.appendEvent({
+        eventType: "fixer.push.skipped",
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        entityType: "pull_request",
+        entityId: buildPullRequestTargetId(
+          requireString(input.queueItem.repo, "queueItem.repo"),
+          requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
+        ),
+        payload: {
+          branch,
+          reason: "auto_push_disabled",
+        },
+      });
       return {
         ...input.checkpoint,
         skipReason: `Auto push disabled; manual fix push required for branch ${branch}`,
@@ -772,16 +1049,76 @@ export class FixerLoopRunner {
       };
     }
 
-    try {
-      await this.options.git.push({
-        worktreePath: input.project.repoPath,
-        branch,
-      });
-    } catch (error) {
+    const reconcile = input.checkpoint.reconcileCommits;
+    if (!reconcile) {
       throw new FixerLoopError(
-        error instanceof Error ? error.message : "Failed to push fixer updates",
+        "Missing reconcile-commits checkpoint for push step",
         "retryable_after_resume",
       );
+    }
+    if (!reconcile.workingTreeClean) {
+      throw new FixerLoopError(
+        "Working tree must be clean before push",
+        "retryable_after_resume",
+      );
+    }
+
+    if (
+      reconcile.finalHeadSha &&
+      reconcile.finalHeadSha === input.checkpoint.worktree?.baseHeadSha
+    ) {
+      this.appendEvent({
+        eventType: "fixer.push.skipped",
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        entityType: "pull_request",
+        entityId: buildPullRequestTargetId(
+          requireString(input.queueItem.repo, "queueItem.repo"),
+          requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
+        ),
+        payload: {
+          branch,
+          reason: "no_new_commits",
+        },
+      });
+      return {
+        ...input.checkpoint,
+        push: {
+          pushed: false,
+          branch,
+          remote: "origin",
+          skippedReason: "No new commits to push",
+        },
+        resumePolicy: "advance_from_checkpoint",
+      };
+    }
+
+    try {
+      await this.options.git.push({
+        worktreePath: requireString(worktree.path, "worktree.path"),
+        branch,
+        expectedRemoteHeadSha: input.checkpoint.worktree?.baseHeadSha,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to push fixer updates";
+      this.appendEvent({
+        eventType: message.toLowerCase().includes("remote head changed")
+          ? "fixer.push.conflicted"
+          : "fixer.push.retryable",
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        entityType: "pull_request",
+        entityId: buildPullRequestTargetId(
+          requireString(input.queueItem.repo, "queueItem.repo"),
+          requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
+        ),
+        payload: {
+          branch,
+          message,
+        },
+      });
+      throw new FixerLoopError(message, "retryable_after_resume");
     }
 
     const metadata = parseJsonObject(input.loop.metadataJson);
@@ -815,8 +1152,109 @@ export class FixerLoopRunner {
       push: {
         pushed: true,
         branch,
+        remote: "origin",
         pushedAt,
       },
+      resumePolicy: "advance_from_checkpoint",
+    };
+  }
+
+  private async runResolveCommentsStep(input: {
+    checkpoint: FixerCheckpoint;
+    project: ProjectRecord;
+    queueItem: QueueItemRecord;
+  }): Promise<FixerCheckpoint> {
+    if (input.checkpoint.skipReason) {
+      return input.checkpoint;
+    }
+    if (!input.checkpoint.validation?.passed) {
+      throw new FixerLoopError(
+        "resolve-comments requires successful validation",
+        "retryable_after_resume",
+      );
+    }
+    if (!input.checkpoint.push) {
+      throw new FixerLoopError(
+        "resolve-comments requires push step to complete",
+        "retryable_after_resume",
+      );
+    }
+
+    const repo = requireString(input.queueItem.repo, "queueItem.repo");
+    const worktreePath = requireString(
+      requireWorktree(input.checkpoint).path,
+      "worktree.path",
+    );
+    const resolvedComments =
+      input.checkpoint.resolvedComments ??
+      ({ items: [] } satisfies NonNullable<
+        FixerCheckpoint["resolvedComments"]
+      >);
+    input.checkpoint.resolvedComments = resolvedComments;
+
+    let failedCount = 0;
+    for (const item of input.checkpoint.fixItems ?? []) {
+      if (item.type !== "comment") {
+        continue;
+      }
+      const existing = resolvedComments.items.find(
+        (entry) =>
+          entry.fixItemId === item.id &&
+          ["resolved", "already_resolved"].includes(entry.status),
+      );
+      if (existing) {
+        continue;
+      }
+
+      try {
+        await this.options.github.resolveReviewThread({
+          repo,
+          threadId: item.threadId,
+          cwd: worktreePath,
+        });
+        upsertResolvedComment(resolvedComments.items, {
+          fixItemId: item.id,
+          threadId: item.threadId,
+          status: "resolved",
+          updatedAt: this.nowIso(),
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Failed to resolve thread";
+        upsertResolvedComment(resolvedComments.items, {
+          fixItemId: item.id,
+          threadId: item.threadId,
+          status: message.includes("already") ? "already_resolved" : "failed",
+          message,
+          updatedAt: this.nowIso(),
+        });
+        if (!message.includes("already")) {
+          failedCount += 1;
+        }
+      }
+    }
+
+    this.appendEvent({
+      eventType: "fixer.comments.resolved",
+      projectId: input.project.id,
+      entityType: "pull_request",
+      entityId: buildPullRequestTargetId(
+        repo,
+        requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
+      ),
+      payload: { items: resolvedComments.items },
+    });
+
+    if (failedCount > 0) {
+      throw new FixerLoopError(
+        `Failed to resolve ${failedCount} review thread(s)`,
+        "retryable_after_resume",
+      );
+    }
+
+    return {
+      ...input.checkpoint,
+      resolvedComments,
       resumePolicy: "advance_from_checkpoint",
     };
   }
@@ -840,7 +1278,7 @@ export class FixerLoopRunner {
       const detail = await this.options.github.viewPullRequest({
         repo,
         prNumber,
-        cwd: input.project.repoPath,
+        cwd: input.checkpoint.worktree?.path ?? input.project.repoPath,
       });
       return {
         ...input.checkpoint,
@@ -1066,6 +1504,105 @@ export class FixerLoopRunner {
     );
   }
 
+  private async reconcileCommits(input: {
+    checkpoint: FixerCheckpoint;
+    commitMessage: string;
+  }): Promise<FixerCheckpoint> {
+    const worktree = requireWorktree(input.checkpoint);
+    const worktreePath = requireString(worktree.path, "worktree.path");
+    const baseHeadSha =
+      input.checkpoint.reconcileCommits?.baseHeadSha ??
+      worktree.baseHeadSha ??
+      worktree.headSha;
+    const initial = await this.options.git.inspectHead({
+      worktreePath,
+      baseRef: baseHeadSha,
+    });
+
+    let committedByLooperd = false;
+    if (initial.hasUncommittedChanges) {
+      if (!this.allowAutoCommit) {
+        throw new FixerLoopError(
+          `Auto commit disabled but fixer worktree has uncommitted changes: ${initial.changedFiles.join(", ") || "unknown files"}`,
+          "manual_intervention",
+        );
+      }
+      await this.options.git.commit({
+        worktreePath,
+        message: input.commitMessage,
+      });
+      committedByLooperd = true;
+    }
+
+    const final = await this.options.git.inspectHead({
+      worktreePath,
+      baseRef: baseHeadSha,
+    });
+    return {
+      ...input.checkpoint,
+      reconcileCommits: {
+        baseHeadSha,
+        finalHeadSha: final.headSha,
+        newCommitShas: final.newCommitShas,
+        committedByAgent: initial.newCommitShas.length > 0,
+        committedByLooperd,
+        workingTreeClean: !final.hasUncommittedChanges,
+        changedFiles: final.changedFiles,
+        completedAt: this.nowIso(),
+      },
+      resumePolicy: "advance_from_checkpoint",
+    };
+  }
+
+  private async cleanupFixerWorktreeIfTerminal(input: {
+    checkpoint: FixerCheckpoint;
+    project: ProjectRecord;
+  }): Promise<void> {
+    const worktree = input.checkpoint.worktree;
+    if (!worktree?.path || !worktree.branch || worktree.cleanedAt) {
+      return;
+    }
+
+    worktree.cleanupAttemptedAt = this.nowIso();
+    try {
+      await this.options.git.cleanupWorktree({
+        projectId: input.project.id,
+        repoPath: input.project.repoPath,
+        worktreePath: worktree.path,
+        branch: worktree.branch,
+        protectedBranches: compactStrings([input.project.baseBranch]),
+      });
+      worktree.cleanedAt = this.nowIso();
+      this.appendEvent({
+        eventType: "fixer.worktree.cleaned",
+        projectId: input.project.id,
+        entityType: "pull_request",
+        entityId: input.project.id,
+        payload: { path: worktree.path, branch: worktree.branch },
+      });
+    } catch (error) {
+      this.appendEvent({
+        eventType: "fixer.worktree.cleanup_failed",
+        projectId: input.project.id,
+        entityType: "pull_request",
+        entityId: input.project.id,
+        payload: {
+          path: worktree.path,
+          branch: worktree.branch,
+          message:
+            error instanceof Error ? error.message : "Unknown cleanup failure",
+        },
+      });
+      this.options.logger.error("fixer worktree cleanup failed", {
+        projectId: input.project.id,
+        worktreePath: worktree.path,
+        branch: worktree.branch,
+        message:
+          error instanceof Error ? error.message : "Unknown cleanup failure",
+      });
+    }
+  }
+
   private async runValidation(input: {
     cwd: string;
     commands: string[];
@@ -1127,7 +1664,15 @@ export class FixerLoopRunner {
       | "loop.step.failed"
       | "run.completed"
       | "run.failed"
-      | "pr.branch.pushed";
+      | "pr.branch.pushed"
+      | "fixer.worktree.prepared"
+      | "fixer.commits.reconciled"
+      | "fixer.comments.resolved"
+      | "fixer.push.skipped"
+      | "fixer.push.retryable"
+      | "fixer.push.conflicted"
+      | "fixer.worktree.cleaned"
+      | "fixer.worktree.cleanup_failed";
     projectId: string;
     loopId?: string;
     runId?: string;
@@ -1178,9 +1723,12 @@ function normalizeFixItems(detail: {
       const id =
         readString((comment as Record<string, unknown>).id) ??
         `comment-${index}`;
+      const threadId =
+        readString((comment as Record<string, unknown>).threadId) ?? id;
       return {
         type: "comment",
         id,
+        threadId,
         summary:
           readString((comment as Record<string, unknown>).body) ??
           readString((comment as Record<string, unknown>).state) ??
@@ -1335,12 +1883,50 @@ function buildFixerPrompt(input: {
   headSha?: string;
   fixItems: FixItem[];
 }): string {
-  return [
-    `Fix pull request ${input.repo}#${input.prNumber}.`,
-    input.headSha ? `Head SHA: ${input.headSha}` : null,
-    `Fix items:\n${input.fixItems.map((item) => `- ${JSON.stringify(item)}`).join("\n")}`,
-    "Only perform repair changes for the listed fix items.",
-  ]
-    .filter((value): value is string => Boolean(value))
-    .join("\n\n");
+  return appendCompletionInstruction(
+    [
+      `Fix pull request ${input.repo}#${input.prNumber}.`,
+      input.headSha ? `Head SHA: ${input.headSha}` : null,
+      `Fix items:\n${input.fixItems.map((item) => `- ${JSON.stringify(item)}`).join("\n")}`,
+      "Only perform repair changes for the listed fix items.",
+      "Focus on code changes needed for the listed fix items. Avoid pushing branches or changing remote review state; Looper will handle follow-up repository actions after your edits.",
+    ]
+      .filter((value): value is string => Boolean(value))
+      .join("\n\n"),
+  );
+}
+
+function requireWorktree(
+  checkpoint: FixerCheckpoint,
+): NonNullable<FixerCheckpoint["worktree"]> {
+  if (!checkpoint.worktree?.path || !checkpoint.worktree.branch) {
+    throw new FixerLoopError(
+      "Missing worktree checkpoint for fixer step",
+      "retryable_after_resume",
+    );
+  }
+  return checkpoint.worktree;
+}
+
+function buildFixerCommitMessage(prNumber: number): string {
+  return `fixer: address PR #${prNumber} follow-up items`;
+}
+
+function compactStrings(values: Array<string | null | undefined>): string[] {
+  return values.filter((value): value is string => Boolean(value));
+}
+
+function upsertResolvedComment(
+  items: NonNullable<FixerCheckpoint["resolvedComments"]>["items"],
+  next: NonNullable<FixerCheckpoint["resolvedComments"]>["items"][number],
+): void {
+  const index = items.findIndex(
+    (item) =>
+      item.fixItemId === next.fixItemId || item.threadId === next.threadId,
+  );
+  if (index >= 0) {
+    items[index] = next;
+    return;
+  }
+  items.push(next);
 }
