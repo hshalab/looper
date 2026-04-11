@@ -626,6 +626,69 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
+  test("ignores unrelated loop bindings when starting a task", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    store.tasks.upsert({
+      id: "task_reuses_wrong_loop",
+      projectId: "project_1",
+      title: "Repair worker binding",
+      description: null,
+      status: "ready",
+      loopId: "loop_1",
+      repo: "acme/looper",
+      prNumber: 42,
+      metadataJson: JSON.stringify({ specPath: "specs/repair.md" }),
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+    store.taskItems.upsert({
+      id: "task_item_reuses_wrong_loop",
+      taskId: "task_reuses_wrong_loop",
+      content: "Fix invalid loop reuse",
+      status: "pending",
+      position: 1,
+      source: "user",
+      metadataJson: null,
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+
+    const response = await api.handle(
+      new Request(
+        "http://localhost/api/v1/tasks/task_reuses_wrong_loop/start",
+        {
+          method: "POST",
+        },
+      ),
+    );
+    const body = (await response.json()) as {
+      data: { loopId: string; status: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.data.status).toBe("in_progress");
+    expect(body.data.loopId).not.toBe("loop_1");
+    expect(store.loops.getById("loop_1")?.status).toBe("running");
+    expect(store.loops.getById(body.data.loopId)).toMatchObject({
+      projectId: "project_1",
+      type: "worker",
+      targetType: "task",
+      targetId: "task:task_reuses_wrong_loop",
+      status: "running",
+    });
+    expect(store.queue.findActiveByDedupe("worker:task_reuses_wrong_loop"))
+      .toMatchObject({
+        loopId: body.data.loopId,
+        taskId: "task_reuses_wrong_loop",
+        type: "worker",
+        status: "queued",
+      });
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
   test("returns validation errors for invalid loop type and status", async () => {
     const { api, store, rootDir } = await createFixture();
 

@@ -645,6 +645,10 @@ function startTask(context: LooperdApiContext, taskId: string) {
   const now = new Date().toISOString();
   let loop = task.loopId ? context.store.loops.getById(task.loopId) : null;
 
+  if (loop && !isReusableWorkerLoopForTask(loop, task)) {
+    loop = null;
+  }
+
   if (!loop) {
     loop = createLoopRecord({
       context,
@@ -913,6 +917,22 @@ function validateTaskStartPrerequisites(
       `Task ${task.id} must have at least one checklist item before it can be started`,
     );
   }
+}
+
+function isReusableWorkerLoopForTask(
+  loop: ReturnType<Store["loops"]["getById"]> extends infer T
+    ? Exclude<T, null>
+    : never,
+  task: ReturnType<Store["tasks"]["getById"]> extends infer T
+    ? Exclude<T, null>
+    : never,
+) {
+  return (
+    loop.projectId === task.projectId &&
+    loop.type === "worker" &&
+    loop.targetType === "task" &&
+    loop.targetId === `task:${task.id}`
+  );
 }
 
 function serializeTask(

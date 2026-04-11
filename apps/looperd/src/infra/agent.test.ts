@@ -111,6 +111,52 @@ describe("ConfiguredAgentExecutor", () => {
     fixture.store.close();
   });
 
+  test("inherits process env before applying agent overrides", async () => {
+    const fixture = await createFixture();
+    const scriptPath = join(fixture.rootDir, "agent-env.sh");
+    const inheritedKey = "LOOPER_TEST_INHERITED_ENV";
+    const previousValue = process.env[inheritedKey];
+    process.env[inheritedKey] = "from-process";
+    await writeExecutable(
+      scriptPath,
+      `#!/bin/sh\nprintf 'inherited=%s\\n' "$${inheritedKey}"\nprintf 'override=%s\\n' "$LOOPER_TEST_OVERRIDE_ENV"\nprintf '__LOOPER_RESULT__={"summary":"done"}\\n'\n`,
+    );
+
+    try {
+      const executor = new ConfiguredAgentExecutor({
+        config: {
+          vendor: "opencode",
+          params: { command: scriptPath },
+          env: {
+            LOOPER_TEST_OVERRIDE_ENV: "from-config",
+          },
+        },
+        store: fixture.store,
+      });
+
+      const execution = await executor.start({
+        prompt: "print env",
+        workingDirectory: fixture.workspace,
+        timeoutMs: 5_000,
+        env: {
+          LOOPER_TEST_OVERRIDE_ENV: "from-input",
+        },
+      });
+      const result = await execution.wait();
+
+      expect(result.status).toBe("completed");
+      expect(result.rawLogs.stdout).toContain("inherited=from-process");
+      expect(result.rawLogs.stdout).toContain("override=from-input");
+    } finally {
+      if (previousValue === undefined) {
+        delete process.env[inheritedKey];
+      } else {
+        process.env[inheritedKey] = previousValue;
+      }
+      fixture.store.close();
+    }
+  });
+
   test("builds claude-code headless invocation", () => {
     expect(
       resolveAgentSpawn(
