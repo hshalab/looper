@@ -31,4 +31,4 @@
 - TypeScript uses project references from the root `tsconfig.json`; prefer root `bun run typecheck` when changes cross packages, and it is intentionally `--noEmit` to avoid regenerating `*.tsbuildinfo`.
 - Formatting/linting is Biome with spaces; use Biome-compatible edits and do not hand-format against another style.
 - Generated/build output lives in `apps/*/dist/` and is ignored by git/Biome; do not edit `dist`.
-- There is no verified CI, README, or other repo-local instruction file yet; rely on `package.json`, tsconfig, and app entrypoints over assumptions.
+- CI lives in `.github/workflows/ci.yml` and runs on PR updates: `bun install --frozen-lockfile`, then `bun run lint`, `bun run typecheck`, `bun run test`, and `bun run build`.
