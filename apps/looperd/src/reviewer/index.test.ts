@@ -323,7 +323,7 @@ describe("ReviewerLoopRunner", () => {
     );
     expect(
       fixture.store.events
-        .listByEntity("pull_request", "acme/looper#42")
+        .listByEntity("pull_request", "pr:acme/looper:42")
         .some((event) => event.eventType === "pr.review.posted"),
     ).toBe(true);
     expect(

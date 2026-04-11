@@ -541,6 +541,7 @@ export class FixerLoopRunner {
       await this.cleanupFixerWorktreeIfTerminal({
         checkpoint,
         project,
+        queueItem,
       });
 
       return {
@@ -623,6 +624,7 @@ export class FixerLoopRunner {
         await this.cleanupFixerWorktreeIfTerminal({
           checkpoint,
           project,
+          queueItem,
         });
       }
 
@@ -1684,11 +1686,17 @@ export class FixerLoopRunner {
   private async cleanupFixerWorktreeIfTerminal(input: {
     checkpoint: FixerCheckpoint;
     project: ProjectRecord;
+    queueItem: QueueItemRecord;
   }): Promise<void> {
     const worktree = input.checkpoint.worktree;
     if (!worktree?.path || !worktree.branch || worktree.cleanedAt) {
       return;
     }
+
+    const pullRequestEntityId = buildPullRequestTargetId(
+      requireString(input.queueItem.repo, "queueItem.repo"),
+      requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
+    );
 
     worktree.cleanupAttemptedAt = this.nowIso();
     try {
@@ -1704,7 +1712,7 @@ export class FixerLoopRunner {
         eventType: "fixer.worktree.cleaned",
         projectId: input.project.id,
         entityType: "pull_request",
-        entityId: input.project.id,
+        entityId: pullRequestEntityId,
         payload: { path: worktree.path, branch: worktree.branch },
       });
     } catch (error) {
@@ -1712,7 +1720,7 @@ export class FixerLoopRunner {
         eventType: "fixer.worktree.cleanup_failed",
         projectId: input.project.id,
         entityType: "pull_request",
-        entityId: input.project.id,
+        entityId: pullRequestEntityId,
         payload: {
           path: worktree.path,
           branch: worktree.branch,

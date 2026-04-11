@@ -1098,7 +1098,7 @@ function buildReviewerDedupeKey(repo: string, prNumber: number): string {
 }
 
 function buildPullRequestEntityId(repo: string, prNumber: number): string {
-  return `${repo}#${prNumber}`;
+  return buildPullRequestTargetId(repo, prNumber);
 }
 
 function buildPullRequestLockKey(queueItem: QueueItemRecord): string {

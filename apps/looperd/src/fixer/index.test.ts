@@ -423,6 +423,11 @@ describe("FixerLoopRunner", () => {
     expect(git.lastExpectedRemoteHeadSha).toBe("abc123");
     expect(github.resolvedThreadIds).toEqual(["thread-1"]);
     expect(git.cleanupCalls).toBe(1);
+    expect(
+      fixture.store.events
+        .listByEntity("pull_request", "pr:acme/looper:42")
+        .some((event) => event.eventType === "fixer.worktree.cleaned"),
+    ).toBe(true);
     const run = fixture.store.runs.listByLoop(result.loopId)[0];
     const checkpoint = JSON.parse(run?.checkpointJson ?? "{}");
     expect(checkpoint.recheck.remainingFixItems).toHaveLength(0);
@@ -796,6 +801,10 @@ describe("FixerLoopRunner", () => {
     expect(eventTypes).toContain("fixer.commits.reconciled");
     expect(eventTypes).toContain("fixer.comments.resolved");
     expect(eventTypes).toContain("pr.branch.pushed");
+    const prEventTypes = fixture.store.events
+      .listByEntity("pull_request", "pr:acme/looper:42")
+      .map((event) => event.eventType);
+    expect(prEventTypes).toContain("pr.branch.pushed");
 
     fixture.store.close();
   });
