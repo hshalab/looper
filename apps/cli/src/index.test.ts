@@ -161,6 +161,41 @@ describe("runCli", () => {
     expect(requests[0]?.body).toContain('"repoPath":"/tmp/repos/looper"');
   });
 
+  test("lists projects", async () => {
+    const lines: string[] = [];
+    const requests: string[] = [];
+    const exitCode = await runCli(["project", "list"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input) => {
+        requests.push(String(input));
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_project_list",
+            data: {
+              items: [
+                {
+                  id: "looper",
+                  name: "Looper",
+                  repoPath: "/tmp/repos/looper",
+                  baseBranch: "main",
+                  repo: "powerformer/looper",
+                  updatedAt: "2026-04-11T00:00:00.000Z",
+                },
+              ],
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]).toContain("/api/v1/projects");
+    expect(lines.join("\n")).toContain("looper");
+    expect(lines.join("\n")).toContain("/tmp/repos/looper");
+  });
+
   test("shows daemon logs tail", async () => {
     const lines: string[] = [];
     const exitCode = await runCli(["daemon", "logs", "--lines", "1"], {

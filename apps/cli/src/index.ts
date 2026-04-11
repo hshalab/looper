@@ -3,6 +3,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { cac } from "cac";
 
 import {
   type ApiClient,
@@ -35,7 +36,10 @@ interface CliContext {
   config: LoadedCliConfig;
   client: ApiClient;
   readFileImpl: (path: string, encoding: "utf8") => Promise<string>;
+  showHelp: (commandName?: string) => void;
 }
+
+type CliRuntime = Omit<CliContext, "args">;
 
 interface LoadedCliConfig {
   config: {
@@ -88,7 +92,6 @@ export async function runCli(
   const writeError = deps.stderr ?? ((line) => console.error(line));
 
   try {
-    const args = parseArgs(argv);
     const loadConfigImpl = deps.loadConfigImpl ?? loadCliConfig;
     const config = await loadConfigImpl({
       argv: extractConfigArgs(argv),
@@ -102,16 +105,31 @@ export async function runCli(
       token: env.LOOPER_TOKEN ?? config.config.server.localToken,
       fetchImpl: deps.fetchImpl,
     });
-    const context: CliContext = {
-      args,
+    const runtime: CliRuntime = {
       write,
       writeError,
       config,
       client,
       readFileImpl: deps.readFileImpl ?? readFile,
+      showHelp: () => {},
     };
 
-    await dispatch(context);
+    const cli = createCli(runtime);
+    runtime.showHelp = (commandName) => {
+      outputCommandHelp(cli, commandName);
+    };
+    cli.parse(["bun", "looper", ...argv], { run: false });
+
+    if (!cli.matchedCommand) {
+      if (argv.includes("--help") || argv.includes("-h")) {
+        return 0;
+      }
+
+      outputCommandHelp(cli, argv[0]);
+      return 0;
+    }
+
+    await cli.runMatchedCommand();
     return 0;
   } catch (error) {
     writeError(formatError(error));
@@ -126,13 +144,18 @@ async function dispatch(context: CliContext): Promise<void> {
     case "status":
       return runStatus(context);
     case "project":
+      if (subcommand === "list") {
+        return runProjectList(context);
+      }
       if (subcommand === "add") {
         return runProjectAdd(context);
       }
-      break;
+      context.showHelp("project");
+      return;
     case "config":
       if (subcommand !== "show") {
-        throw new Error("Usage: looper config show [--json]");
+        context.showHelp("config");
+        return;
       }
       return runConfigShow(context);
     case "daemon":
@@ -142,7 +165,8 @@ async function dispatch(context: CliContext): Promise<void> {
       if (subcommand === "logs") {
         return runDaemonLogs(context);
       }
-      break;
+      context.showHelp("daemon");
+      return;
     case "loop":
       if (subcommand === "list") {
         return runLoopList(context);
@@ -153,7 +177,8 @@ async function dispatch(context: CliContext): Promise<void> {
       if (subcommand === "pause") {
         return runLoopPause(context);
       }
-      break;
+      context.showHelp("loop");
+      return;
     case "task":
       if (subcommand === "create") {
         return runTaskCreate(context);
@@ -170,7 +195,8 @@ async function dispatch(context: CliContext): Promise<void> {
       if (subcommand === "show") {
         return runTaskShow(context);
       }
-      break;
+      context.showHelp("task");
+      return;
     case "pr":
       if (subcommand === "list") {
         return runPrList(context);
@@ -181,19 +207,194 @@ async function dispatch(context: CliContext): Promise<void> {
       if (subcommand === "status") {
         return runPrStatus(context);
       }
-      break;
+      context.showHelp("pr");
+      return;
     case "run":
       if (subcommand === "list") {
         return runRunList(context);
       }
-      break;
+      context.showHelp("run");
+      return;
     default:
       break;
   }
 
-  throw new Error(
-    "Usage: looper <status|project|config|daemon|loop|task|pr|run> ...",
+  throw new Error(`Unknown command: ${context.args.positionals.join(" ")}`);
+}
+
+function createCli(runtime: CliRuntime) {
+  const cli = cac("looper");
+
+  addGlobalOptions(cli);
+
+  cli.command("status", "Show service status").action(async (options) => {
+    await dispatch(createContext(runtime, ["status"], options));
+  });
+
+  cli
+    .command("project [...args]", "Project commands")
+    .usage("project <subcommand> [options]")
+    .option("--repo-path <path>", "Repository path")
+    .option("--id <id>", "Project id")
+    .option("--name <name>", "Project name")
+    .option("--base-branch <branch>", "Base branch")
+    .option("--worktree-root <path>", "Worktree root")
+    .option("--repo <repo>", "Repository slug")
+    .example((name) => `  $ ${name} project list`)
+    .example((name) => `  $ ${name} project add /path/to/repo`)
+    .action(async (args, options) => {
+      await dispatch(createContext(runtime, ["project", ...args], options));
+    });
+
+  cli
+    .command("config [...args]", "Config commands")
+    .usage("config <subcommand> [options]")
+    .example((name) => `  $ ${name} config show --json`)
+    .action(async (args, options) => {
+      await dispatch(createContext(runtime, ["config", ...args], options));
+    });
+
+  cli
+    .command("daemon [...args]", "Daemon commands")
+    .usage("daemon <subcommand> [options]")
+    .option("--lines <count>", "Line count")
+    .example((name) => `  $ ${name} daemon status`)
+    .example((name) => `  $ ${name} daemon logs --lines 50`)
+    .action(async (args, options) => {
+      await dispatch(createContext(runtime, ["daemon", ...args], options));
+    });
+
+  cli
+    .command("loop [...args]", "Loop commands")
+    .usage("loop <subcommand> [options]")
+    .option("--id <id>", "Loop id")
+    .option("--type <type>", "Loop type")
+    .option("--task <taskId>", "Task id")
+    .option("--pr <repo#number>", "Pull request reference")
+    .example((name) => `  $ ${name} loop list`)
+    .example(
+      (name) => `  $ ${name} loop start --type reviewer --pr acme/looper#42`,
+    )
+    .action(async (args, options) => {
+      await dispatch(createContext(runtime, ["loop", ...args], options));
+    });
+
+  cli
+    .command("task [...args]", "Task commands")
+    .usage("task <subcommand> [options]")
+    .option("--project <projectId>", "Project id")
+    .option("--title <title>", "Task title")
+    .option("--description <description>", "Task description")
+    .option("--spec <path>", "Spec path")
+    .option("--pr <repo#number>", "Pull request reference")
+    .option("--item <item>", "Checklist item", { type: [String] })
+    .example(
+      (name) =>
+        `  $ ${name} task create --project project_1 --title "Ship CLI"`,
+    )
+    .example((name) => `  $ ${name} task status task_1`)
+    .action(async (args, options) => {
+      await dispatch(createContext(runtime, ["task", ...args], options));
+    });
+
+  cli
+    .command("pr [...args]", "Pull request commands")
+    .usage("pr <subcommand> [options]")
+    .example((name) => `  $ ${name} pr list`)
+    .example((name) => `  $ ${name} pr show acme/looper#42`)
+    .action(async (args, options) => {
+      await dispatch(createContext(runtime, ["pr", ...args], options));
+    });
+
+  cli
+    .command("run [...args]", "Run commands")
+    .usage("run <subcommand> [options]")
+    .option("--loop <loopId>", "Filter by loop id")
+    .example((name) => `  $ ${name} run list`)
+    .example((name) => `  $ ${name} run list --loop loop_1`)
+    .action(async (args, options) => {
+      await dispatch(createContext(runtime, ["run", ...args], options));
+    });
+
+  cli.help();
+
+  return cli;
+}
+
+function addGlobalOptions(cli: ReturnType<typeof cac>) {
+  cli.option("--json", "Emit JSON output");
+  cli.option("--config <path>", "Config path");
+  cli.option("--host <host>", "Server host");
+  cli.option("--port <port>", "Server port");
+  cli.option("--db-path <path>", "Database path");
+  cli.option("--log-dir <path>", "Daemon log directory");
+  cli.option("--daemon-mode <mode>", "Daemon mode");
+  cli.option("--bun-path <path>", "Bun binary path");
+  cli.option("--git-path <path>", "Git binary path");
+  cli.option("--gh-path <path>", "GitHub CLI path");
+  cli.option("--osascript-path <path>", "osascript binary path");
+}
+
+function outputCommandHelp(
+  cli: ReturnType<typeof cac>,
+  commandName?: string,
+): void {
+  if (!commandName) {
+    cli.outputHelp();
+    return;
+  }
+
+  const command = cli.commands.find(
+    (entry) =>
+      entry.name === commandName || entry.aliasNames.includes(commandName),
   );
+  if (command) {
+    command.outputHelp();
+    return;
+  }
+
+  cli.outputHelp();
+}
+
+function createContext(
+  runtime: CliRuntime,
+  positionals: string[],
+  options: Record<string, unknown>,
+): CliContext {
+  return {
+    ...runtime,
+    args: buildParsedArgs(positionals, options),
+  };
+}
+
+function buildParsedArgs(
+  positionals: string[],
+  options: Record<string, unknown>,
+): ParsedArgs {
+  const flags = new Map<string, string[]>();
+
+  for (const [name, value] of Object.entries(options)) {
+    if (value === undefined || value === false || name === "--") {
+      continue;
+    }
+
+    const key = camelToKebab(name);
+    if (Array.isArray(value)) {
+      flags.set(
+        key,
+        value.map((item) => String(item)),
+      );
+      continue;
+    }
+
+    flags.set(key, [value === true ? "true" : String(value)]);
+  }
+
+  return { positionals, flags };
+}
+
+function camelToKebab(value: string): string {
+  return value.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
 }
 
 async function runStatus(context: CliContext) {
@@ -263,11 +464,34 @@ async function runConfigShow(context: CliContext) {
   printJson(context.write, data);
 }
 
+async function runProjectList(context: CliContext) {
+  const data = await context.client.get<{
+    items: Array<Record<string, unknown>>;
+  }>("/api/v1/projects");
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, data);
+  }
+
+  printTable(
+    context.write,
+    data.items.map((project) => ({
+      id: project.id as string,
+      name: project.name as string,
+      repoPath: project.repoPath as string,
+      baseBranch: (project.baseBranch as string | null | undefined) ?? "-",
+      repo: (project.repo as string | null | undefined) ?? "-",
+      updatedAt: project.updatedAt as string,
+    })),
+  );
+}
+
 async function runProjectAdd(context: CliContext) {
   const repoPathArg =
     context.args.positionals[2] ?? getFlag(context.args, "repo-path");
   if (!repoPathArg) {
-    throw new Error("Usage: looper project add <repo-path>");
+    context.showHelp("project");
+    return;
   }
 
   const repoPath = resolve(repoPathArg);
@@ -680,46 +904,6 @@ function emitTaskResult(
     ["status", data.status as string],
     ["loopId", (data.loopId as string | null | undefined) ?? "-"],
   ]);
-}
-
-function parseArgs(argv: string[]): ParsedArgs {
-  const positionals: string[] = [];
-  const flags = new Map<string, string[]>();
-
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (!arg) {
-      continue;
-    }
-    if (!arg.startsWith("--")) {
-      positionals.push(arg);
-      continue;
-    }
-
-    const trimmed = arg.slice(2);
-    const eqIndex = trimmed.indexOf("=");
-    const name = eqIndex >= 0 ? trimmed.slice(0, eqIndex) : trimmed;
-    const existing = flags.get(name) ?? [];
-
-    if (eqIndex >= 0) {
-      existing.push(trimmed.slice(eqIndex + 1));
-      flags.set(name, existing);
-      continue;
-    }
-
-    const next = argv[index + 1];
-    if (!next || next.startsWith("--")) {
-      existing.push("true");
-      flags.set(name, existing);
-      continue;
-    }
-
-    existing.push(next);
-    flags.set(name, existing);
-    index += 1;
-  }
-
-  return { positionals, flags };
 }
 
 function extractConfigArgs(argv: string[]): string[] {

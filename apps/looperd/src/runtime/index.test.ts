@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createDefaultLooperConfig } from "../config/index";
 import { createLogger } from "../bootstrap/logger";
+import { createDefaultLooperConfig } from "../config/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import { createLooperdRuntime } from "./index";
 

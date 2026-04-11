@@ -1,4 +1,4 @@
-import { access, constants } from "node:fs/promises";
+import { constants, access } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import {
@@ -7,9 +7,9 @@ import {
   ConfigValidationError,
   DAEMON_MODES,
   LOG_LEVELS,
+  type LooperConfig,
   NOTIFICATION_SOUND_LEVELS,
   OPEN_PR_STRATEGIES,
-  type LooperConfig,
   type ValidationIssue,
 } from "./types";
 

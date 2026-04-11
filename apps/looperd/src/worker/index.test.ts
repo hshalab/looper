@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,11 +8,11 @@ import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import type { WorktreeRecord } from "../storage/types";
 import {
-  WorkerLoopRunner,
   type WorkerAgentExecution,
   type WorkerAgentExecutor,
   type WorkerGitGateway,
   type WorkerGitHubGateway,
+  WorkerLoopRunner,
   type WorkerValidationResult,
 } from "./index";
 

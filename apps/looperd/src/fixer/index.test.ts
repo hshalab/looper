@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,11 +7,11 @@ import type { AgentResult, AgentRunInput } from "../infra/agent";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import {
-  FixerLoopRunner,
   type FixerAgentExecution,
   type FixerAgentExecutor,
   type FixerGitGateway,
   type FixerGitHubGateway,
+  FixerLoopRunner,
   type FixerValidationResult,
 } from "./index";
 

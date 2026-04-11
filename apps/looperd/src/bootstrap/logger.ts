@@ -1,4 +1,4 @@
-import { mkdir, appendFile } from "node:fs/promises";
+import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { LoggingConfig } from "../config/index";

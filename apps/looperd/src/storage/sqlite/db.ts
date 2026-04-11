@@ -1,13 +1,13 @@
-import { mkdir } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 
 import { Database } from "bun:sqlite";
 
 import type { StorageHealth } from "../types";
 import {
-  createMigrationRunner,
   type SqliteMigrationRunner,
   type SqliteMigrationRunnerOptions,
+  createMigrationRunner,
 } from "./migrate";
 import {
   buildBackupPath as buildSqliteBackupPath,

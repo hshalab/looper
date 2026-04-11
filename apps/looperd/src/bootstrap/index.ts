@@ -1,9 +1,9 @@
-import { access, mkdir, constants } from "node:fs/promises";
+import { constants, access, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { type LoadedLooperConfig, loadLooperConfig } from "../config/index";
-import { createLooperdRuntime, type LooperdRuntime } from "../runtime/index";
-import { createLogger, type Logger } from "./logger";
+import { type LooperdRuntime, createLooperdRuntime } from "../runtime/index";
+import { type Logger, createLogger } from "./logger";
 
 export interface BootstrapLooperdOptions {
   argv?: string[];

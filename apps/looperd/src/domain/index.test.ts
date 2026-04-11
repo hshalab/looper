@@ -1,18 +1,18 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  assertStepBelongsToLoopType,
   assertLoopStatusTransition,
   assertRunStatusTransition,
+  assertStepBelongsToLoopType,
   assertTaskItemStatusTransition,
-  assertTaskStatusTransition,
   assertTaskPrUniqueness,
+  assertTaskStatusTransition,
   assertUniqueActiveLoop,
   createAuditEvent,
-  createLoop,
   createLock,
-  createProject,
+  createLoop,
   createPrLockKey,
+  createProject,
   createRun,
   createTask,
   createTaskLockKey,
