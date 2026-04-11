@@ -380,72 +380,72 @@ export class FixerLoopRunner {
         ? checkpoint.claimedLockKey
         : undefined;
 
-    if (claimedLockKey) {
-      const acquired = this.options.scheduler.acquireBusinessLock({
-        key: claimedLockKey,
-        owner: queueItem.id,
-        reason: "fixer-run-resume",
-        expiresAt: new Date(
-          this.now().getTime() + this.claimTtlMs,
-        ).toISOString(),
-      });
-      if (!acquired) {
-        throw new FixerLoopError(
-          `Pull request lock is already held for ${claimedLockKey}`,
-          "retryable_transient",
-        );
-      }
-    }
-
-    this.updateLoop(loop, {
-      status: "running",
-      lastRunAt: run.startedAt,
-      nextRunAt: null,
-    });
-    this.appendEvent({
-      eventType: "loop.started",
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      entityType: "loop",
-      entityId: loop.id,
-      payload: {
-        queueItemId: queueItem.id,
-        resumed: resumedRun.resumed,
-        startStep: resumedRun.startStep,
-      },
-    });
-    this.options.logger.info("fixer loop started", {
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      queueItemId: queueItem.id,
-      taskId: queueItem.taskId,
-      currentStep: resumedRun.startStep,
-      resumed: resumedRun.resumed,
-    });
-    this.appendEvent({
-      eventType: "run.started",
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      entityType: "run",
-      entityId: run.id,
-      payload: {
-        queueItemId: queueItem.id,
-        currentStep: resumedRun.startStep,
-      },
-    });
-    this.options.logger.info("fixer run started", {
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      queueItemId: queueItem.id,
-      taskId: queueItem.taskId,
-      currentStep: resumedRun.startStep,
-    });
-
     try {
+      if (claimedLockKey) {
+        const acquired = this.options.scheduler.acquireBusinessLock({
+          key: claimedLockKey,
+          owner: queueItem.id,
+          reason: "fixer-run-resume",
+          expiresAt: new Date(
+            this.now().getTime() + this.claimTtlMs,
+          ).toISOString(),
+        });
+        if (!acquired) {
+          throw new FixerLoopError(
+            `Pull request lock is already held for ${claimedLockKey}`,
+            "retryable_transient",
+          );
+        }
+      }
+
+      this.updateLoop(loop, {
+        status: "running",
+        lastRunAt: run.startedAt,
+        nextRunAt: null,
+      });
+      this.appendEvent({
+        eventType: "loop.started",
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        entityType: "loop",
+        entityId: loop.id,
+        payload: {
+          queueItemId: queueItem.id,
+          resumed: resumedRun.resumed,
+          startStep: resumedRun.startStep,
+        },
+      });
+      this.options.logger.info("fixer loop started", {
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        queueItemId: queueItem.id,
+        taskId: queueItem.taskId,
+        currentStep: resumedRun.startStep,
+        resumed: resumedRun.resumed,
+      });
+      this.appendEvent({
+        eventType: "run.started",
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        entityType: "run",
+        entityId: run.id,
+        payload: {
+          queueItemId: queueItem.id,
+          currentStep: resumedRun.startStep,
+        },
+      });
+      this.options.logger.info("fixer run started", {
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        queueItemId: queueItem.id,
+        taskId: queueItem.taskId,
+        currentStep: resumedRun.startStep,
+      });
+
       for (const step of FIXER_STEP_SEQUENCE.slice(
         FIXER_STEP_SEQUENCE.indexOf(resumedRun.startStep),
       )) {

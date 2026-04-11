@@ -1194,12 +1194,16 @@ describe("FixerLoopRunner", () => {
           checks: [],
           headSha: "abc123",
         },
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "abc123",
+        },
       ],
     });
-    const git = new FakeGitGateway();
-    git.prepareWorktree = async (input) => {
-      throw new RemoteHeadChangedError(input.branch, "old-head", "new-head");
-    };
+    const git = new FakeGitGateway({
+      pushError: "Remote head changed for feature/fixer",
+    });
     const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
     const runner = new FixerLoopRunner({
       store: fixture.store,
@@ -1231,9 +1235,7 @@ describe("FixerLoopRunner", () => {
         key: "pr:acme/looper:42",
         owner: "reviewer-1",
         reason: "reviewer-run",
-        expiresAt: new Date(
-          fixture.now.getTime() + 5_000,
-        ).toISOString(),
+        expiresAt: new Date("2099-01-01T00:00:00.000Z").toISOString(),
       }),
     ).toBe(true);
 
@@ -1245,7 +1247,7 @@ describe("FixerLoopRunner", () => {
     expect(retry.status).toBe("failed");
     expect(retry.failureKind).toBe("retryable_transient");
     expect(retry.summary).toContain("Pull request lock is already held");
-    expect(agent.starts).toHaveLength(0);
+    expect(agent.starts).toHaveLength(1);
 
     fixture.store.close();
   });

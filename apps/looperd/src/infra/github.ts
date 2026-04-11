@@ -183,10 +183,10 @@ export class GhCliGitHubGateway {
       threadId: input.threadId,
       cwd: input.cwd,
     });
-    if (!thread) {
+    if (thread === null) {
       throw new ReviewThreadNotFoundError(input.threadId);
     }
-    if (thread.isResolved) {
+    if (thread?.isResolved) {
       return;
     }
 
@@ -364,7 +364,7 @@ export class GhCliGitHubGateway {
       input.cwd,
     );
 
-    const payload = asObject(result.stdout);
+    const payload = asOptionalObject(result.stdout) ?? {};
     const repository = (payload.data as Record<string, unknown> | undefined)
       ?.repository as Record<string, unknown> | undefined;
     const pullRequest = repository?.pullRequest as
@@ -382,7 +382,7 @@ export class GhCliGitHubGateway {
     repo: string;
     threadId: string;
     cwd?: string;
-  }): Promise<ReviewThreadNode | null> {
+  }): Promise<ReviewThreadNode | null | undefined> {
     const result = await this.runGh(
       [
         "api",
@@ -403,13 +403,20 @@ export class GhCliGitHubGateway {
       ],
       input.cwd,
     );
-    const payload = asObject(result.stdout);
-    const node = (payload.data as Record<string, unknown> | undefined)?.node as
-      | Record<string, unknown>
-      | undefined;
+    const payload = asOptionalObject(result.stdout);
+    if (!payload) {
+      return undefined;
+    }
+
+    const data = payload.data as Record<string, unknown> | undefined;
+    if (data?.node === null) {
+      return null;
+    }
+
+    const node = data?.node as Record<string, unknown> | undefined;
     const id = asOptionalString(node?.id);
     if (!id) {
-      return null;
+      return undefined;
     }
 
     return {
@@ -512,6 +519,14 @@ function asObject(value: string): Record<string, unknown> {
       durationMs: 0,
     });
   }
+}
+
+function asOptionalObject(value: string): Record<string, unknown> | undefined {
+  if (value.trim().length === 0) {
+    return undefined;
+  }
+
+  return asObject(value);
 }
 
 function asArray(value: string): Record<string, unknown>[] {

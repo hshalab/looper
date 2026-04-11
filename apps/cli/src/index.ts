@@ -242,7 +242,7 @@ function createCli(runtime: CliRuntime) {
     .option("--repo <repo>", "Repository slug")
     .example((name) => `  $ ${name} project list`)
     .example((name) => `  $ ${name} project add /path/to/repo`)
-    .action(async (args, options) => {
+    .action(async (args: string[], options: Record<string, unknown>) => {
       await dispatch(createContext(runtime, ["project", ...args], options));
     });
 
@@ -250,7 +250,7 @@ function createCli(runtime: CliRuntime) {
     .command("config [...args]", "Config commands")
     .usage("config <subcommand> [options]")
     .example((name) => `  $ ${name} config show --json`)
-    .action(async (args, options) => {
+    .action(async (args: string[], options: Record<string, unknown>) => {
       await dispatch(createContext(runtime, ["config", ...args], options));
     });
 
@@ -260,7 +260,7 @@ function createCli(runtime: CliRuntime) {
     .option("--lines <count>", "Line count")
     .example((name) => `  $ ${name} daemon status`)
     .example((name) => `  $ ${name} daemon logs --lines 50`)
-    .action(async (args, options) => {
+    .action(async (args: string[], options: Record<string, unknown>) => {
       await dispatch(createContext(runtime, ["daemon", ...args], options));
     });
 
@@ -275,7 +275,7 @@ function createCli(runtime: CliRuntime) {
     .example(
       (name) => `  $ ${name} loop start --type reviewer --pr acme/looper#42`,
     )
-    .action(async (args, options) => {
+    .action(async (args: string[], options: Record<string, unknown>) => {
       await dispatch(createContext(runtime, ["loop", ...args], options));
     });
 
@@ -293,7 +293,7 @@ function createCli(runtime: CliRuntime) {
         `  $ ${name} task create --project project_1 --title "Ship CLI"`,
     )
     .example((name) => `  $ ${name} task status task_1`)
-    .action(async (args, options) => {
+    .action(async (args: string[], options: Record<string, unknown>) => {
       await dispatch(createContext(runtime, ["task", ...args], options));
     });
 
@@ -302,7 +302,7 @@ function createCli(runtime: CliRuntime) {
     .usage("pr <subcommand> [options]")
     .example((name) => `  $ ${name} pr list`)
     .example((name) => `  $ ${name} pr show acme/looper#42`)
-    .action(async (args, options) => {
+    .action(async (args: string[], options: Record<string, unknown>) => {
       await dispatch(createContext(runtime, ["pr", ...args], options));
     });
 
@@ -312,7 +312,7 @@ function createCli(runtime: CliRuntime) {
     .option("--loop <loopId>", "Filter by loop id")
     .example((name) => `  $ ${name} run list`)
     .example((name) => `  $ ${name} run list --loop loop_1`)
-    .action(async (args, options) => {
+    .action(async (args: string[], options: Record<string, unknown>) => {
       await dispatch(createContext(runtime, ["run", ...args], options));
     });
 
