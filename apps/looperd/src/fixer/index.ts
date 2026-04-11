@@ -374,7 +374,28 @@ export class FixerLoopRunner {
     const resumedRun = this.createRunContext(loop);
     let run = resumedRun.run;
     let checkpoint = resumedRun.checkpoint;
-    let claimedLockKey: string | undefined;
+    let claimedLockKey =
+      FIXER_STEP_SEQUENCE.indexOf(resumedRun.startStep) >
+      FIXER_STEP_SEQUENCE.indexOf("claim-pr")
+        ? checkpoint.claimedLockKey
+        : undefined;
+
+    if (claimedLockKey) {
+      const acquired = this.options.scheduler.acquireBusinessLock({
+        key: claimedLockKey,
+        owner: queueItem.id,
+        reason: "fixer-run-resume",
+        expiresAt: new Date(
+          this.now().getTime() + this.claimTtlMs,
+        ).toISOString(),
+      });
+      if (!acquired) {
+        throw new FixerLoopError(
+          `Pull request lock is already held for ${claimedLockKey}`,
+          "retryable_transient",
+        );
+      }
+    }
 
     this.updateLoop(loop, {
       status: "running",

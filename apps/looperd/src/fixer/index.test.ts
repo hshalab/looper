@@ -1185,6 +1185,71 @@ describe("FixerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("reacquires the PR lock before resumed fixer steps", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      views: [
+        {
+          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
+          checks: [],
+          headSha: "abc123",
+        },
+      ],
+    });
+    const git = new FakeGitGateway();
+    git.prepareWorktree = async (input) => {
+      throw new RemoteHeadChangedError(input.branch, "old-head", "new-head");
+    };
+    const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      git,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+      }),
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("fixer-1");
+    if (!firstClaim) throw new Error("Expected first fixer claim");
+
+    const first = await runner.processClaimedItem(firstClaim);
+    expect(first.status).toBe("failed");
+    expect(first.failureKind).toBe("retryable_after_resume");
+
+    expect(
+      fixture.queue.acquireBusinessLock({
+        key: "pr:acme/looper:42",
+        owner: "reviewer-1",
+        reason: "reviewer-run",
+        expiresAt: new Date(
+          fixture.now.getTime() + 5_000,
+        ).toISOString(),
+      }),
+    ).toBe(true);
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("fixer-1");
+    if (!retryClaim) throw new Error("Expected retry fixer claim");
+
+    const retry = await runner.processClaimedItem(retryClaim);
+    expect(retry.status).toBe("failed");
+    expect(retry.failureKind).toBe("retryable_transient");
+    expect(retry.summary).toContain("Pull request lock is already held");
+    expect(agent.starts).toHaveLength(0);
+
+    fixture.store.close();
+  });
+
   test("retries push conflicts from prepare-worktree and reruns repair", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
