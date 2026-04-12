@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { Database } from "bun:sqlite";
 
 import { SqliteStore } from "./sqlite-store";
 
@@ -80,30 +82,6 @@ describe("SqliteStore", () => {
       createdAt: now,
       updatedAt: now,
     });
-    store.tasks.upsert({
-      id: "task_1",
-      projectId: "project_1",
-      title: "Implement persistence",
-      description: "Finish SQLite foundation",
-      status: "in_progress",
-      loopId: "loop_1",
-      repo: "acme/looper",
-      prNumber: 42,
-      metadataJson: '{"source":"spec"}',
-      createdAt: now,
-      updatedAt: now,
-    });
-    store.taskItems.upsert({
-      id: "item_1",
-      taskId: "task_1",
-      content: "Write migrations",
-      status: "done",
-      position: 1,
-      source: "spec",
-      metadataJson: null,
-      createdAt: now,
-      updatedAt: now,
-    });
     store.pullRequestSnapshots.upsert({
       id: "snapshot_1",
       projectId: "project_1",
@@ -142,7 +120,6 @@ describe("SqliteStore", () => {
       id: "queue_reviewer_1",
       projectId: "project_1",
       loopId: "loop_1",
-      taskId: null,
       type: "reviewer",
       targetType: "pull_request",
       targetId: "pr:acme/looper:42",
@@ -169,7 +146,6 @@ describe("SqliteStore", () => {
       id: "queue_fixer_1",
       projectId: "project_1",
       loopId: null,
-      taskId: null,
       type: "fixer",
       targetType: "pull_request",
       targetId: "pr:acme/looper:42",
@@ -208,7 +184,6 @@ describe("SqliteStore", () => {
       projectId: "project_1",
       loopId: "loop_1",
       runId: "run_1",
-      taskId: "task_1",
       vendor: "opencode",
       status: "running",
       pid: 12345,
@@ -232,17 +207,17 @@ describe("SqliteStore", () => {
       projectId: "project_1",
       loopId: "loop_1",
       runId: "run_1",
-      entityType: "task",
-      entityId: "task_1",
+      entityType: "loop",
+      entityId: "loop_1",
       channel: "in_app",
       level: "info",
-      title: "Task updated",
-      subtitle: "task_1",
-      body: "Checklist advanced",
+      title: "Loop updated",
+      subtitle: "loop_1",
+      body: "Worker progressed",
       status: "success",
-      dedupeKey: "task.updated:task:task_1",
+      dedupeKey: "loop.updated:loop:loop_1",
       errorMessage: null,
-      payloadJson: '{"title":"Task updated"}',
+      payloadJson: '{"title":"Loop updated"}',
       sentAt: now,
       createdAt: now,
       updatedAt: now,
@@ -250,10 +225,9 @@ describe("SqliteStore", () => {
     store.worktrees.upsert({
       id: "worktree_1",
       projectId: "project_1",
-      taskId: "task_1",
       repoPath: "/tmp/looper",
-      worktreePath: "/tmp/looper-worktrees/task-1",
-      branch: "task/task-1",
+      worktreePath: "/tmp/looper-worktrees/feature-loop-1",
+      branch: "feature/loop-1",
       baseBranch: "main",
       status: "active",
       headSha: "abc123",
@@ -276,11 +250,6 @@ describe("SqliteStore", () => {
     expect(store.loops.getById("loop_1")?.repo).toBe("acme/looper");
     expect(store.loops.getById("loop_1")?.projectId).toBe("project_1");
     expect(store.runs.listByLoop("loop_1")).toHaveLength(1);
-    expect(store.tasks.list()).toHaveLength(1);
-    expect(store.tasks.getById("task_1")?.projectId).toBe("project_1");
-    expect(store.taskItems.listByTask("task_1")[0]?.content).toBe(
-      "Write migrations",
-    );
     expect(
       store.pullRequestSnapshots.getLatest("acme/looper", 42)?.headSha,
     ).toBe("abc123");
@@ -315,20 +284,208 @@ describe("SqliteStore", () => {
     expect(
       store.notifications.getLatestByDedupe(
         "in_app",
-        "task.updated:task:task_1",
+        "loop.updated:loop:loop_1",
       )?.status,
     ).toBe("success");
     expect(
-      store.worktrees.getByBranch("project_1", "task/task-1")?.status,
+      store.worktrees.getByBranch("project_1", "feature/loop-1")?.status,
     ).toBe("active");
 
     const health = store.schema.healthcheck();
     expect(health.ok).toBe(true);
-    expect(health.migration.latestAppliedId).toBe("0003_scheduler_queue");
+    expect(health.migration.latestAppliedId).toBe("0004_worker_project_target");
     expect(health.lastUpdatedAt).toBeString();
 
     const backupPath = store.schema.backup();
     await access(backupPath);
+
+    store.close();
+  });
+
+  test("migrates legacy task-target worker schemas to project-target worker schemas", async () => {
+    const fixture = await createStoreFixture();
+    await mkdir(join(fixture.rootDir, "state"), { recursive: true });
+    const db = new Database(fixture.dbPath, { create: true });
+    db.exec(`
+      CREATE TABLE schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations (id, applied_at) VALUES
+        ('0001_init', '2026-04-11T00:00:00.000Z'),
+        ('0002_integrations', '2026-04-11T00:00:00.000Z'),
+        ('0003_scheduler_queue', '2026-04-11T00:00:00.000Z');
+
+      CREATE TABLE projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        repo_path TEXT NOT NULL,
+        base_branch TEXT,
+        archived INTEGER NOT NULL DEFAULT 0,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE loops (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT,
+        repo TEXT,
+        pr_number INTEGER,
+        status TEXT NOT NULL,
+        config_json TEXT,
+        metadata_json TEXT,
+        last_run_at TEXT,
+        next_run_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (target_type IN ('task', 'pull_request', 'repository', 'manual'))
+      );
+
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        loop_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_step TEXT,
+        last_completed_step TEXT,
+        checkpoint_json TEXT,
+        summary TEXT,
+        error_message TEXT,
+        started_at TEXT NOT NULL,
+        last_heartbeat_at TEXT,
+        ended_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE queue_items (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        loop_id TEXT,
+        task_id TEXT,
+        type TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        repo TEXT,
+        pr_number INTEGER,
+        dedupe_key TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        available_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        claimed_by TEXT,
+        claimed_at TEXT,
+        started_at TEXT,
+        finished_at TEXT,
+        lock_key TEXT,
+        payload_json TEXT,
+        last_error TEXT,
+        last_error_kind TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE agent_executions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        loop_id TEXT,
+        run_id TEXT,
+        task_id TEXT,
+        vendor TEXT NOT NULL,
+        status TEXT NOT NULL,
+        pid INTEGER,
+        command_json TEXT,
+        cwd TEXT,
+        summary TEXT,
+        parse_status TEXT,
+        completion_signal TEXT,
+        heartbeat_count INTEGER NOT NULL DEFAULT 0,
+        last_heartbeat_at TEXT,
+        output_json TEXT,
+        error_message TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE worktrees (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT,
+        repo_path TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        base_branch TEXT,
+        status TEXT NOT NULL,
+        head_sha TEXT,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        cleaned_at TEXT
+      );
+
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE task_items (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      INSERT INTO projects (id, name, repo_path, base_branch, archived, metadata_json, created_at, updated_at)
+      VALUES ('project_1', 'Looper', '/tmp/looper', 'main', 0, NULL, '2026-04-11T00:00:00.000Z', '2026-04-11T00:00:00.000Z');
+
+      INSERT INTO loops (id, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
+      VALUES ('loop_worker_1', 'project_1', 'worker', 'task', 'task_1', 'acme/looper', NULL, 'queued', NULL, NULL, NULL, '2026-04-11T00:00:00.000Z', '2026-04-11T00:00:00.000Z', '2026-04-11T00:00:00.000Z');
+
+      INSERT INTO queue_items (id, project_id, loop_id, task_id, type, target_type, target_id, repo, pr_number, dedupe_key, priority, status, available_at, attempts, max_attempts, claimed_by, claimed_at, started_at, finished_at, lock_key, payload_json, last_error, last_error_kind, created_at, updated_at)
+      VALUES ('queue_worker_1', 'project_1', 'loop_worker_1', 'task_1', 'worker', 'task', 'task:task_1', 'acme/looper', NULL, 'worker:task_1', 1, 'queued', '2026-04-11T00:00:00.000Z', 0, 3, NULL, NULL, NULL, NULL, 'task:task_1', NULL, NULL, NULL, '2026-04-11T00:00:00.000Z', '2026-04-11T00:00:00.000Z');
+    `);
+    db.close(false);
+
+    const store = new SqliteStore({ dbPath: fixture.dbPath });
+    store.initialize({ autoMigrate: true });
+
+    expect(store.schema.healthcheck().migration.latestAppliedId).toBe(
+      "0004_worker_project_target",
+    );
+    expect(store.loops.getById("loop_worker_1")).toMatchObject({
+      targetType: "project",
+      targetId: "project_1",
+      status: "paused",
+    });
+    expect(store.queue.getById("queue_worker_1")).toMatchObject({
+      targetType: "project",
+      targetId: "project_1",
+      dedupeKey: "worker:loop_worker_1",
+      status: "cancelled",
+      lockKey: "worker:loop_worker_1",
+    });
+    expect(
+      store.withTransaction(() => {
+        try {
+          store.schema.healthcheck();
+          return true;
+        } catch {
+          return false;
+        }
+      }),
+    ).toBe(true);
 
     store.close();
   });
@@ -353,25 +510,28 @@ describe("SqliteStore", () => {
 
     expect(() =>
       store.withTransaction((tx) => {
-        tx.tasks.upsert({
-          id: "task_rollback",
+        tx.loops.upsert({
+          id: "loop_rollback",
           projectId: "project_1",
-          title: "Temporary",
-          description: null,
-          status: "pending",
-          loopId: null,
+          type: "worker",
+          targetType: "project",
+          targetId: "project_1",
           repo: null,
           prNumber: null,
+          status: "queued",
+          configJson: null,
           metadataJson: null,
+          lastRunAt: null,
+          nextRunAt: null,
           createdAt: now,
           updatedAt: now,
         });
         tx.events.append({
-          id: "event_rollback",
-          eventType: "task.created",
+          id: "event_loop_rollback",
+          eventType: "loop.created",
           projectId: "project_1",
-          entityType: "task",
-          entityId: "task_rollback",
+          entityType: "loop",
+          entityId: "loop_rollback",
           payloadJson: "{}",
           createdAt: now,
         });
@@ -380,8 +540,8 @@ describe("SqliteStore", () => {
       }),
     ).toThrow("abort transaction");
 
-    expect(store.tasks.getById("task_rollback")).toBeNull();
-    expect(store.events.listByEntity("task", "task_rollback")).toHaveLength(0);
+    expect(store.loops.getById("loop_rollback")).toBeNull();
+    expect(store.events.listByEntity("loop", "loop_rollback")).toHaveLength(0);
 
     store.close();
   });
@@ -440,8 +600,8 @@ describe("SqliteStore", () => {
       id: "loop_paused",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: null,
       prNumber: null,
       status: "paused",
@@ -452,30 +612,16 @@ describe("SqliteStore", () => {
       createdAt: now,
       updatedAt: now,
     });
-    store.tasks.upsert({
-      id: "task_1",
-      projectId: "project_1",
-      title: "Queued task",
-      description: null,
-      status: "ready",
-      loopId: "loop_paused",
-      repo: null,
-      prNumber: null,
-      metadataJson: null,
-      createdAt: now,
-      updatedAt: now,
-    });
     store.queue.upsert({
       id: "queue_worker_1",
       projectId: "project_1",
       loopId: "loop_paused",
-      taskId: "task_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: null,
       prNumber: null,
-      dedupeKey: "worker:task_1",
+      dedupeKey: "worker:loop_paused",
       priority: 3,
       status: "queued",
       availableAt: now,
@@ -485,7 +631,7 @@ describe("SqliteStore", () => {
       claimedAt: null,
       startedAt: null,
       finishedAt: null,
-      lockKey: "task:task_1",
+      lockKey: "worker:loop_paused",
       payloadJson: null,
       lastError: null,
       lastErrorKind: null,
@@ -547,8 +693,8 @@ describe("SqliteStore", () => {
       id: "loop_1",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: null,
       prNumber: null,
       status: "running",
