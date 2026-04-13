@@ -88,9 +88,10 @@ export class SqliteStore implements Store {
     upsert: (record: LoopRecord): void => {
       this.coordinator.db
         .query(`
-          INSERT INTO loops (id, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+          INSERT INTO loops (id, seq, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
           ON CONFLICT(id) DO UPDATE SET
+            seq=excluded.seq,
             project_id=excluded.project_id,
             type=excluded.type,
             target_type=excluded.target_type,
@@ -106,6 +107,7 @@ export class SqliteStore implements Store {
         `)
         .run(
           record.id,
+          record.seq,
           record.projectId,
           record.type,
           record.targetType,
@@ -120,6 +122,15 @@ export class SqliteStore implements Store {
           record.createdAt,
           record.updatedAt,
         );
+
+      this.coordinator.db
+        .query(
+          `INSERT INTO counters (name, value)
+           VALUES ('loop_seq', ?1)
+           ON CONFLICT(name) DO UPDATE SET value =
+             CASE WHEN excluded.value > counters.value THEN excluded.value ELSE counters.value END`,
+        )
+        .run(record.seq);
     },
     getById: (id: string): LoopRecord | null => {
       const row = this.coordinator.db
@@ -127,9 +138,42 @@ export class SqliteStore implements Store {
         .get(id) as Record<string, unknown> | null;
       return row ? mapLoop(row) : null;
     },
+    getBySeq: (seq: number): LoopRecord | null => {
+      const row = this.coordinator.db
+        .query("SELECT * FROM loops WHERE seq = ?1")
+        .get(seq) as Record<string, unknown> | null;
+      return row ? mapLoop(row) : null;
+    },
+    allocateSeq: (): number => {
+      const existing = this.coordinator.db
+        .query("SELECT value FROM counters WHERE name = 'loop_seq'")
+        .get() as Record<string, unknown> | null;
+
+      if (!existing) {
+        const maxSeqRow = this.coordinator.db
+          .query("SELECT COALESCE(MAX(seq), 0) AS value FROM loops")
+          .get() as Record<string, unknown> | null;
+        const currentValue = Number(maxSeqRow?.value ?? 0);
+        this.coordinator.db
+          .query("INSERT INTO counters (name, value) VALUES ('loop_seq', ?1)")
+          .run(currentValue);
+      }
+
+      const row = this.coordinator.db
+        .query(
+          "UPDATE counters SET value = value + 1 WHERE name = 'loop_seq' RETURNING value",
+        )
+        .get() as Record<string, unknown> | null;
+
+      if (!row) {
+        throw new Error("Failed to allocate loop sequence");
+      }
+
+      return Number(row.value);
+    },
     list: (): LoopRecord[] => {
       const rows = this.coordinator.db
-        .query("SELECT * FROM loops ORDER BY updated_at DESC")
+        .query("SELECT * FROM loops ORDER BY updated_at DESC, seq DESC")
         .all() as Record<string, unknown>[];
       return rows.map(mapLoop);
     },
@@ -173,6 +217,14 @@ export class SqliteStore implements Store {
       const row = this.coordinator.db
         .query("SELECT * FROM runs WHERE id = ?1")
         .get(id) as Record<string, unknown> | null;
+      return row ? mapRun(row) : null;
+    },
+    getLatestByLoopId: (loopId: string): RunRecord | null => {
+      const row = this.coordinator.db
+        .query(
+          "SELECT * FROM runs WHERE loop_id = ?1 ORDER BY started_at DESC LIMIT 1",
+        )
+        .get(loopId) as Record<string, unknown> | null;
       return row ? mapRun(row) : null;
     },
     list: (): RunRecord[] => {
@@ -582,6 +634,22 @@ export class SqliteStore implements Store {
           input.updatedAt,
         );
     },
+    requeueRunningByLoop: (loopId: string, queuedAt: string): number => {
+      const result = this.coordinator.db
+        .query(
+          `UPDATE queue_items
+           SET status = 'queued',
+               available_at = ?2,
+               claimed_by = NULL,
+               claimed_at = NULL,
+               started_at = NULL,
+               finished_at = NULL,
+               updated_at = ?2
+           WHERE loop_id = ?1 AND status = 'running'`,
+        )
+        .run(loopId, queuedAt);
+      return result.changes;
+    },
     cancelByLoop: (
       loopId: string,
       finishedAt: string,
@@ -658,10 +726,28 @@ export class SqliteStore implements Store {
         .get(id) as Record<string, unknown> | null;
       return row ? mapAgentExecution(row) : null;
     },
+    getLatestByRunId: (runId: string): AgentExecutionRecord | null => {
+      const row = this.coordinator.db
+        .query(
+          "SELECT * FROM agent_executions WHERE run_id = ?1 ORDER BY started_at DESC LIMIT 1",
+        )
+        .get(runId) as Record<string, unknown> | null;
+      return row ? mapAgentExecution(row) : null;
+    },
     list: (): AgentExecutionRecord[] => {
       return this.coordinator.db
         .query("SELECT * FROM agent_executions ORDER BY started_at DESC")
         .all()
+        .map((row: unknown) =>
+          mapAgentExecution(row as Record<string, unknown>),
+        );
+    },
+    listByRunId: (runId: string): AgentExecutionRecord[] => {
+      return this.coordinator.db
+        .query(
+          "SELECT * FROM agent_executions WHERE run_id = ?1 ORDER BY started_at DESC",
+        )
+        .all(runId)
         .map((row: unknown) =>
           mapAgentExecution(row as Record<string, unknown>),
         );
@@ -828,6 +914,7 @@ function mapProject(row: Record<string, unknown>): ProjectRecord {
 function mapLoop(row: Record<string, unknown>): LoopRecord {
   return {
     id: String(row.id),
+    seq: Number(row.seq),
     projectId: String(row.project_id),
     type: String(row.type),
     targetType: String(row.target_type),

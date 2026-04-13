@@ -2,7 +2,7 @@
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { cac } from "cac";
 
 import {
@@ -27,17 +27,24 @@ interface CliDeps {
   stderr?: Writer;
   env?: Record<string, string | undefined>;
   cwd?: string;
+  isStdoutTty?: boolean;
+  launchShellImpl?: (options: {
+    cwd: string;
+    env: Record<string, string | undefined>;
+  }) => Promise<number>;
 }
 
 interface CliContext {
   args: ParsedArgs;
   write: Writer;
   writeError: Writer;
-  cwd: string;
   config: LoadedCliConfig;
   client: ApiClient;
   readFileImpl: (path: string, encoding: "utf8") => Promise<string>;
   showHelp: (commandName?: string) => void;
+  env: Record<string, string | undefined>;
+  isStdoutTty: boolean;
+  launchShell: (cwd: string) => Promise<number>;
 }
 
 type CliRuntime = Omit<CliContext, "args">;
@@ -66,18 +73,12 @@ interface ParsedArgs {
 }
 
 interface PullRequestRef {
-  repo?: string;
+  repo: string;
   prNumber: number;
 }
 
-interface ProjectSummary {
-  id: string;
-  repoPath: string;
-  repo?: string | null;
-  worktreeRoot?: string | null;
-}
-
 interface ActiveRunItem {
+  seq: number;
   runId: string;
   loopId: string;
   projectId: string;
@@ -113,6 +114,41 @@ interface ActiveRunItem {
     lastHeartbeatAt: string | null;
     heartbeatCount: number;
     status: string;
+  } | null;
+  worktree: {
+    id: string | null;
+    path: string;
+    branch: string | null;
+  } | null;
+}
+
+interface LoopLogsEnvelope {
+  seq: number;
+  loopId: string;
+  loopType: string;
+  loopStatus: string;
+  run: {
+    runId: string;
+    status: string;
+    currentStep: string | null;
+    startedAt: string;
+    endedAt: string | null;
+    summary: string | null;
+    errorMessage: string | null;
+  } | null;
+  agent: {
+    executionId: string;
+    vendor: string;
+    status: string;
+    pid: number | null;
+    startedAt: string;
+    endedAt: string | null;
+    heartbeatCount: number;
+    lastHeartbeatAt: string | null;
+    summary: string | null;
+    parseStatus: string | null;
+    stdout: string;
+    stderr: string;
   } | null;
 }
 
@@ -155,11 +191,17 @@ export async function runCli(
     const runtime: CliRuntime = {
       write,
       writeError,
-      cwd,
       config,
       client,
       readFileImpl: deps.readFileImpl ?? readFile,
       showHelp: () => {},
+      env,
+      isStdoutTty: deps.isStdoutTty ?? Boolean(process.stdout.isTTY),
+      launchShell: async (shellCwd) =>
+        (deps.launchShellImpl ?? launchInteractiveShell)({
+          cwd: shellCwd,
+          env,
+        }),
     };
 
     const cli = createCli(runtime);
@@ -257,6 +299,12 @@ async function dispatch(context: CliContext): Promise<void> {
       return;
     case "ps":
       return runPs(context);
+    case "jump":
+      return runJump(context);
+    case "logs":
+      return runLogs(context);
+    case "stop":
+      return runStop(context);
     default:
       break;
   }
@@ -322,39 +370,27 @@ function createCli(runtime: CliRuntime) {
 
   cli
     .command("work", "Create a worker run")
-    .option(
-      "--project <projectId>",
-      "Project id (auto-detected from cwd when omitted)",
-    )
+    .option("--project <projectId>", "Project id")
     .option("--title <title>", "Task title")
     .option("--prompt <text>", "Implementation prompt")
     .option("--spec <path>", "Spec path")
-    .option("--pr <ref>", "Start work on an existing spec PR")
-    .option("--issue <ref>", "Start work from a planner issue")
     .option("--repo <repo>", "Repository slug")
     .option("--base-branch <branch>", "Base branch")
     .example(
       (name) =>
         `  $ ${name} work --project project_1 --title "Ship CLI" --spec specs/ship-cli.md`,
     )
-    .example((name) => `  $ ${name} work --pr 42`)
-    .example((name) => `  $ ${name} work --pr acme/looper#42`)
-    .example((name) => `  $ ${name} work --issue 123`)
-    .example((name) => `  $ ${name} work --issue acme/looper#123`)
     .action(async (options) => {
       await dispatch(createContext(runtime, ["work"], options));
     });
 
   cli
-    .command("plan <issue>", "Create a planner run")
-    .option(
-      "--project <projectId>",
-      "Project id (auto-detected from cwd when omitted)",
-    )
-    .example((name) => `  $ ${name} plan 123`)
-    .example((name) => `  $ ${name} plan acme/looper#123`)
-    .action(async (issue, options) => {
-      await dispatch(createContext(runtime, ["plan", issue], options));
+    .command("plan", "Create a planner run")
+    .option("--project <projectId>", "Project id")
+    .option("--issue <number>", "Issue number")
+    .example((name) => `  $ ${name} plan --project project_1 --issue 123`)
+    .action(async (options) => {
+      await dispatch(createContext(runtime, ["plan"], options));
     });
 
   cli
@@ -374,6 +410,35 @@ function createCli(runtime: CliRuntime) {
     .example((name) => `  $ ${name} ps --type reviewer --project project_1`)
     .action(async (options) => {
       await dispatch(createContext(runtime, ["ps"], options));
+    });
+
+  cli
+    .command("jump [id]", "Print shell command for a loop worktree")
+    .option("--print-path", "Print the worktree path only")
+    .option("--shell-integration <shell>", "Print shell integration helper")
+    .example((name) => `  $ eval \"$(${name} jump 12)\"`)
+    .example((name) => `  $ ${name} jump 12 --print-path`)
+    .example((name) => `  $ ${name} jump --shell-integration bash`)
+    .action(async (id, options) => {
+      await dispatch(createContext(runtime, ["jump", id], options));
+    });
+
+  cli
+    .command("logs <id>", "Show logs for a loop")
+    .option("--stderr", "Show stderr instead of stdout")
+    .option("--tail <count>", "Show the last N lines")
+    .option("--full", "Show the full output")
+    .example((name) => `  $ ${name} logs 12`)
+    .example((name) => `  $ ${name} logs 12 --stderr --tail 50`)
+    .action(async (id, options) => {
+      await dispatch(createContext(runtime, ["logs", id], options));
+    });
+
+  cli
+    .command("stop <id>", "Stop an active loop")
+    .example((name) => `  $ ${name} stop 12`)
+    .action(async (id, options) => {
+      await dispatch(createContext(runtime, ["stop", id], options));
     });
 
   cli
@@ -717,15 +782,14 @@ async function buildLoopCreateBody(context: CliContext) {
 
   if (pr) {
     const ref = parsePullRequestRef(pr);
-    const repo = requireRepoFromRef(ref, "pull request");
     const snapshot = await context.client.get<Record<string, unknown>>(
-      `/api/v1/pull-requests/${encodeURIComponent(repo)}/${ref.prNumber}`,
+      `/api/v1/pull-requests/${encodeURIComponent(ref.repo)}/${ref.prNumber}`,
     );
     return {
       projectId: snapshot.projectId,
       type,
       targetType: "pull_request",
-      repo,
+      repo: ref.repo,
       prNumber: ref.prNumber,
       status: "running",
     };
@@ -737,7 +801,7 @@ async function buildLoopCreateBody(context: CliContext) {
 async function runLoopPause(context: CliContext) {
   const loopId = context.args.positionals[2] ?? getFlag(context.args, "id");
   if (!loopId) {
-    throw new Error("Usage: looper loop pause <loop-id>");
+    throw new Error("Usage: looper loop pause <id>");
   }
 
   const data = await context.client.post<Record<string, unknown>>(
@@ -755,10 +819,16 @@ async function runLoopPause(context: CliContext) {
 }
 
 async function runWorkCreate(context: CliContext) {
-  const body = await buildWorkCreateBody(context);
   const data = await context.client.post<Record<string, unknown>>(
     "/api/v1/workers",
-    body,
+    {
+      projectId: requireFlag(context.args, "project"),
+      title: requireFlag(context.args, "title"),
+      prompt: getFlag(context.args, "prompt"),
+      specPath: getFlag(context.args, "spec"),
+      repo: getFlag(context.args, "repo"),
+      baseBranch: getFlag(context.args, "base-branch"),
+    },
   );
 
   if (hasFlag(context.args, "json")) {
@@ -772,239 +842,17 @@ async function runWorkCreate(context: CliContext) {
   ]);
 }
 
-async function buildWorkCreateBody(context: CliContext) {
-  const prompt = getFlag(context.args, "prompt");
-  const specPath = getFlag(context.args, "spec");
-  const pr = getFlag(context.args, "pr");
-  const issue = getFlag(context.args, "issue");
-  const modeCount =
-    Number(Boolean(pr)) +
-    Number(Boolean(issue)) +
-    Number(Boolean(prompt || specPath));
-
-  if (modeCount === 0) {
-    throw new Error(
-      "work requires one of: --prompt/--spec, --pr <repo>#<number>, or --issue <number>",
-    );
-  }
-  if (modeCount > 1) {
-    throw new Error(
-      "work accepts only one input mode at a time: create-pr, --pr, or --issue",
-    );
-  }
-
-  const title = getFlag(context.args, "title");
-  const repo = getFlag(context.args, "repo");
-  const baseBranch = getFlag(context.args, "base-branch");
-
-  if (pr) {
-    const ref = parseOptionalRepoNumberRef(pr, "pull request");
-    const project = await resolveProjectForWork(context, {
-      repo: ref.repo ?? repo,
-      requireRepoMatch: Boolean(ref.repo),
-    });
-    const resolvedRepo = ref.repo ?? repo ?? project.repo;
-    if (!resolvedRepo) {
-      throw new Error(
-        "Could not determine repo for pull request; pass --pr <repo>#<number>, --repo <repo>, or --project <projectId>",
-      );
-    }
-    return {
-      projectId: project.id,
-      title,
-      repo: resolvedRepo,
-      prNumber: ref.prNumber,
-      baseBranch,
-    };
-  }
-
-  if (issue) {
-    const ref = parseOptionalRepoNumberRef(issue, "issue");
-    const project = await resolveProjectForWork(context, {
-      repo: ref.repo ?? repo,
-      requireRepoMatch: Boolean(ref.repo),
-    });
-    const resolvedRepo = ref.repo ?? repo ?? project.repo;
-    if (!resolvedRepo) {
-      throw new Error(
-        "Could not determine repo for issue; pass --issue <repo>#<number>, --repo <repo>, or --project <projectId>",
-      );
-    }
-    return {
-      projectId: project.id,
-      title,
-      issueNumber: ref.prNumber,
-      repo: resolvedRepo,
-      baseBranch,
-    };
-  }
-
-  const project = await resolveProjectForWork(context, { repo });
-
-  return {
-    projectId: project.id,
-    title,
-    prompt,
-    specPath,
-    repo,
-    baseBranch,
-  };
-}
-
-async function resolveProjectForWork(
-  context: CliContext,
-  hint?: { repo?: string; requireRepoMatch?: boolean },
-): Promise<ProjectSummary> {
-  const projects = await listProjects(context);
-  const explicitProjectId = getFlag(context.args, "project");
-  if (explicitProjectId) {
-    const project = projects.find(
-      (candidate) => candidate.id === explicitProjectId,
-    );
-    if (!project) {
-      throw new Error(`Project not found: ${explicitProjectId}`);
-    }
-    if (
-      hint?.repo &&
-      hint.requireRepoMatch &&
-      project.repo !== null &&
-      project.repo !== hint.repo
-    ) {
-      throw new Error(
-        `Project ${explicitProjectId} is for repo ${project.repo}, but ${hint.repo} was requested`,
-      );
-    }
-    return project;
-  }
-
-  if (hint?.repo) {
-    const matches = projects.filter((project) => project.repo === hint.repo);
-    if (matches.length === 1) {
-      const project = matches[0];
-      if (project) {
-        return project;
-      }
-    }
-    if (matches.length > 1) {
-      throw new Error(
-        `Multiple projects match repo ${hint.repo}; pass --project <projectId>`,
-      );
-    }
-
-    const projectFromCwd = inferProjectFromCwd(context.cwd, projects);
-    if (
-      projectFromCwd &&
-      (projectFromCwd.repo == null || projectFromCwd.repo === hint.repo)
-    ) {
-      return projectFromCwd;
-    }
-
-    throw new Error(
-      `Project not found for repo ${hint.repo}; pass --project <projectId>`,
-    );
-  }
-
-  const projectFromCwd = inferProjectFromCwd(context.cwd, projects);
-  if (projectFromCwd) {
-    return projectFromCwd;
-  }
-
-  throw new Error(
-    "Could not infer project from the current working directory; pass --project <projectId>",
-  );
-}
-
-async function listProjects(context: CliContext): Promise<ProjectSummary[]> {
-  const data = await context.client.get<{
-    items: Array<Record<string, unknown>>;
-  }>("/api/v1/projects");
-
-  const projects: ProjectSummary[] = [];
-  for (const project of data.items) {
-    if (
-      typeof project.id !== "string" ||
-      typeof project.repoPath !== "string"
-    ) {
-      continue;
-    }
-
-    projects.push({
-      id: project.id,
-      repoPath: project.repoPath,
-      repo: typeof project.repo === "string" ? project.repo : null,
-      worktreeRoot:
-        typeof project.worktreeRoot === "string" ? project.worktreeRoot : null,
-    });
-  }
-
-  return projects;
-}
-
-function inferProjectFromCwd(
-  cwdValue: string,
-  projects: ProjectSummary[],
-): ProjectSummary | null {
-  const cwd = resolve(cwdValue);
-  const matches = projects
-    .map((project) => ({
-      project,
-      matchLength: Math.max(
-        pathMatchLength(cwd, project.repoPath),
-        typeof project.worktreeRoot === "string"
-          ? pathMatchLength(cwd, project.worktreeRoot)
-          : -1,
-      ),
-    }))
-    .filter((project) => project.matchLength >= 0)
-    .sort((left, right) => right.matchLength - left.matchLength);
-
-  const bestMatch = matches[0];
-  if (!bestMatch) {
-    return null;
-  }
-
-  const equallySpecificMatches = matches.filter(
-    (match) => match.matchLength === bestMatch.matchLength,
-  );
-  if (equallySpecificMatches.length > 1) {
-    throw new Error(
-      "Multiple projects match the current working directory; pass --project <projectId>",
-    );
-  }
-
-  return bestMatch.project;
-}
-
-function pathMatchLength(candidatePath: string, rootPath: string): number {
-  const absoluteRoot = resolve(rootPath);
-  const relation = relative(absoluteRoot, candidatePath);
-  if (
-    relation === "" ||
-    (!relation.startsWith("..") && !isAbsolute(relation))
-  ) {
-    return absoluteRoot.length;
-  }
-
-  return -1;
-}
-
 async function runPlannerCreate(context: CliContext) {
-  const issueText = context.args.positionals[1];
-  if (!issueText) {
-    throw new Error("Usage: looper plan <issue|repo#issue>");
+  const issueNumber = Number(requireFlag(context.args, "issue"));
+  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+    throw new Error("--issue must be a positive integer");
   }
-  const repo = getFlag(context.args, "repo");
-  const issueRef = parseOptionalRepoNumberRef(issueText, "issue");
-  const project = await resolveProjectForWork(context, {
-    repo: issueRef.repo ?? repo,
-    requireRepoMatch: Boolean(issueRef.repo),
-  });
 
   const data = await context.client.post<Record<string, unknown>>(
     "/api/v1/planners",
     {
-      projectId: project.id,
-      issueNumber: issueRef.prNumber,
+      projectId: requireFlag(context.args, "project"),
+      issueNumber,
     },
   );
 
@@ -1046,9 +894,8 @@ async function runPrShow(context: CliContext) {
     throw new Error("Usage: looper pr show <repo>#<number>");
   }
   const ref = parsePullRequestRef(refText);
-  const repo = requireRepoFromRef(ref, "pull request");
   const data = await context.client.get<Record<string, unknown>>(
-    `/api/v1/pull-requests/${encodeURIComponent(repo)}/${ref.prNumber}`,
+    `/api/v1/pull-requests/${encodeURIComponent(ref.repo)}/${ref.prNumber}`,
   );
 
   if (hasFlag(context.args, "json")) {
@@ -1070,9 +917,8 @@ async function runPrStatus(context: CliContext) {
     throw new Error("Usage: looper pr status <repo>#<number>");
   }
   const ref = parsePullRequestRef(refText);
-  const repo = requireRepoFromRef(ref, "pull request");
   const data = await context.client.get<Record<string, unknown>>(
-    `/api/v1/pull-requests/${encodeURIComponent(repo)}/${ref.prNumber}/status`,
+    `/api/v1/pull-requests/${encodeURIComponent(ref.repo)}/${ref.prNumber}/status`,
   );
 
   if (hasFlag(context.args, "json")) {
@@ -1145,9 +991,9 @@ async function runPs(context: CliContext) {
   printTable(
     context.write,
     data.items.map((item) => ({
+      "#": item.seq,
       type: item.type,
       target: item.target.label,
-      run: item.runId,
       step: item.currentStep ?? "-",
       agent: item.agent?.vendor ?? "-",
       pid: item.agent?.pid ?? "-",
@@ -1155,6 +1001,136 @@ async function runPs(context: CliContext) {
       age: formatRelativeAge(item.startedAt),
     })),
   );
+}
+
+async function runJump(context: CliContext) {
+  const shell = getFlag(context.args, "shell-integration");
+  if (shell) {
+    context.write(buildShellIntegration(shell));
+    return;
+  }
+
+  const selector = requireSelector(context, "Usage: looper jump <id>");
+  const data = await context.client.get<ActiveRunItem>(
+    `/api/v1/runs/active/${encodeURIComponent(selector)}`,
+  );
+
+  if (!data.worktree?.path) {
+    throw new Error(`Loop ${selector} has no active worktree path`);
+  }
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, {
+      seq: data.seq,
+      loopId: data.loopId,
+      projectId: data.projectId,
+      worktree: data.worktree,
+    });
+  }
+
+  if (hasFlag(context.args, "print-path")) {
+    context.write(data.worktree.path);
+    return;
+  }
+
+  if (context.isStdoutTty) {
+    await context.launchShell(data.worktree.path);
+    return;
+  }
+
+  context.write(`cd -- ${quoteShellArg(data.worktree.path)}`);
+}
+
+async function launchInteractiveShell(options: {
+  cwd: string;
+  env: Record<string, string | undefined>;
+}): Promise<number> {
+  const shell = options.env.SHELL || "/bin/zsh";
+  const subprocess = Bun.spawn([shell, "-i"], {
+    cwd: options.cwd,
+    env: options.env,
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  return await subprocess.exited;
+}
+
+async function runLogs(context: CliContext) {
+  const selector = requireSelector(context, "Usage: looper logs <id>");
+  const data = await context.client.get<LoopLogsEnvelope>(
+    `/api/v1/loops/${encodeURIComponent(selector)}/logs`,
+  );
+
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, data);
+  }
+
+  const stream = hasFlag(context.args, "stderr")
+    ? (data.agent?.stderr ?? "")
+    : (data.agent?.stdout ?? "");
+  const tailCount = hasFlag(context.args, "full")
+    ? undefined
+    : (readOptionalPositiveIntegerFlag(context.args, "tail") ?? 100);
+
+  context.write(`Loop #${data.seq} · ${data.loopType} · ${data.loopStatus}`);
+  if (data.run) {
+    context.write(
+      `Run ${data.run.runId} · step: ${data.run.currentStep ?? "-"}`,
+    );
+  } else {
+    context.write("Run - · step: -");
+  }
+
+  if (!data.agent) {
+    context.write("No agent output for the current step.");
+    return;
+  }
+
+  context.write(
+    `Agent: ${data.agent.vendor} · pid ${data.agent.pid ?? "-"} · ${data.agent.status}`,
+  );
+  context.write("");
+
+  const content =
+    tailCount === undefined ? stream : tailText(stream, tailCount);
+  if (!content) {
+    context.write("No output captured.");
+    return;
+  }
+
+  for (const line of content.split("\n")) {
+    context.write(line);
+  }
+}
+
+async function runStop(context: CliContext) {
+  const selector = requireSelector(context, "Usage: looper stop <id>");
+  const data = await context.client.post<Record<string, unknown>>(
+    `/api/v1/runs/active/${encodeURIComponent(selector)}/stop`,
+  );
+  const stopped = Boolean(data.stopped);
+
+  if (hasFlag(context.args, "json")) {
+    printJson(context.write, data);
+    if (!stopped) {
+      throw new Error(`Loop ${selector} could not be stopped`);
+    }
+    return;
+  }
+
+  printSection(context.write, "Loop stopped", [
+    ["loopId", data.loopId as string],
+    ["runId", (data.runId as string | undefined) ?? "-"],
+    ["executionId", (data.executionId as string | undefined) ?? "-"],
+    ["vendor", (data.vendor as string | undefined) ?? "-"],
+    ["pid", (data.pid as number | null | undefined) ?? "-"],
+    ["stopped", stopped],
+  ]);
+
+  if (!stopped) {
+    throw new Error(`Loop ${selector} could not be stopped`);
+  }
 }
 
 function formatRelativeAge(startedAt: string): string {
@@ -1185,6 +1161,54 @@ function formatRelativeAge(startedAt: string): string {
   return remainingHours === 0
     ? `${totalDays}d`
     : `${totalDays}d${remainingHours}h`;
+}
+
+function requireSelector(context: CliContext, usage: string): string {
+  const selector = context.args.positionals[1];
+  if (!selector) {
+    throw new Error(usage);
+  }
+
+  return selector;
+}
+
+function readOptionalPositiveIntegerFlag(
+  args: ParsedArgs,
+  name: string,
+): number | undefined {
+  const value = getFlag(args, name);
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`--${name} must be a positive integer`);
+  }
+
+  return parsed;
+}
+
+function tailText(value: string, count: number): string {
+  const lines = value.split("\n");
+  const trimmed = lines.at(-1) === "" ? lines.slice(0, -1) : lines;
+  return trimmed.slice(-count).join("\n");
+}
+
+function quoteShellArg(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function buildShellIntegration(shell: string): string {
+  switch (shell) {
+    case "bash":
+    case "zsh":
+      return 'lj() { eval "$(looper jump "$@")"; }';
+    case "fish":
+      return "function lj\n  eval (looper jump $argv)\nend";
+    default:
+      throw new Error(`Unsupported shell: ${shell}`);
+  }
 }
 
 function extractConfigArgs(argv: string[]): string[] {
@@ -1235,51 +1259,21 @@ function requireFlag(args: ParsedArgs, name: string): string {
 }
 
 function parsePullRequestRef(value: string): PullRequestRef {
-  const parsed = parseOptionalRepoNumberRef(value, "pull request");
-  if (!parsed.repo) {
+  const match = /^(?<repo>[^#]+)#(?<prNumber>\d+)$/.exec(value);
+  if (!match?.groups) {
     throw new Error(`Invalid pull request reference: ${value}`);
   }
 
-  return parsed;
-}
-
-function parseOptionalRepoNumberRef(
-  value: string,
-  label: "pull request" | "issue",
-): PullRequestRef {
-  const qualifiedMatch = /^(?<repo>[^#]+)#(?<number>\d+)$/.exec(value);
-  if (qualifiedMatch?.groups) {
-    const repo = qualifiedMatch.groups.repo;
-    const numberValue = qualifiedMatch.groups.number;
-    if (!repo || !numberValue) {
-      throw new Error(`Invalid ${label} reference: ${value}`);
-    }
-
-    return {
-      repo,
-      prNumber: Number(numberValue),
-    };
+  const repo = match.groups.repo;
+  const prNumber = match.groups.prNumber;
+  if (!repo || !prNumber) {
+    throw new Error(`Invalid pull request reference: ${value}`);
   }
 
-  const numberValue = Number(value);
-  if (Number.isInteger(numberValue) && numberValue > 0) {
-    return {
-      prNumber: numberValue,
-    };
-  }
-
-  throw new Error(`Invalid ${label} reference: ${value}`);
-}
-
-function requireRepoFromRef(
-  ref: PullRequestRef,
-  label: "pull request" | "issue",
-): string {
-  if (!ref.repo) {
-    throw new Error(`Missing repo for ${label} reference`);
-  }
-
-  return ref.repo;
+  return {
+    repo,
+    prNumber: Number(prNumber),
+  };
 }
 
 function deriveProjectId(repoPath: string): string {

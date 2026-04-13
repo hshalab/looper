@@ -30,6 +30,73 @@ async function createStoreFixture() {
 }
 
 describe("SqliteStore", () => {
+  test("resolves loops by seq and allocates past seeded sequence values", async () => {
+    const fixture = await createStoreFixture();
+    const store = new SqliteStore({
+      dbPath: fixture.dbPath,
+      backupDir: fixture.backupDir,
+    });
+
+    store.initialize({ autoMigrate: true });
+
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: "/tmp/looper",
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.loops.upsert({
+      id: "loop_3",
+      seq: 3,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.loops.upsert({
+      id: "loop_7",
+      seq: 7,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(store.loops.getBySeq(7)?.id).toBe("loop_7");
+
+    const db = new Database(fixture.dbPath);
+    db.query("DELETE FROM counters WHERE name = 'loop_seq'").run();
+    db.close();
+
+    expect(store.loops.allocateSeq()).toBe(8);
+    expect(store.loops.allocateSeq()).toBe(9);
+
+    store.close();
+  });
+
   test("initializes schema, writes records, and reports health", async () => {
     const fixture = await createStoreFixture();
     const store = new SqliteStore({
@@ -53,6 +120,7 @@ describe("SqliteStore", () => {
     });
     store.loops.upsert({
       id: "loop_1",
+      seq: 1,
       projectId: "project_1",
       type: "reviewer",
       targetType: "pull_request",
@@ -250,6 +318,7 @@ describe("SqliteStore", () => {
     expect(store.loops.getById("loop_1")?.repo).toBe("acme/looper");
     expect(store.loops.getById("loop_1")?.projectId).toBe("project_1");
     expect(store.runs.listByLoop("loop_1")).toHaveLength(1);
+    expect(store.runs.getLatestByLoopId("loop_1")?.id).toBe("run_1");
     expect(
       store.pullRequestSnapshots.getLatest("acme/looper", 42)?.headSha,
     ).toBe("abc123");
@@ -293,7 +362,9 @@ describe("SqliteStore", () => {
 
     const health = store.schema.healthcheck();
     expect(health.ok).toBe(true);
-    expect(health.migration.latestAppliedId).toBe("0005_planner_issue_target");
+    expect(health.migration.latestAppliedId).toBe(
+      "0007_agent_execution_run_index",
+    );
     expect(health.lastUpdatedAt).toBeString();
 
     const backupPath = store.schema.backup();
@@ -462,7 +533,7 @@ describe("SqliteStore", () => {
     store.initialize({ autoMigrate: true });
 
     expect(store.schema.healthcheck().migration.latestAppliedId).toBe(
-      "0005_planner_issue_target",
+      "0007_agent_execution_run_index",
     );
     expect(store.loops.getById("loop_worker_1")).toMatchObject({
       targetType: "project",
@@ -485,6 +556,15 @@ describe("SqliteStore", () => {
           return false;
         }
       }),
+    ).toBe(true);
+
+    const migratedDb = new Database(fixture.dbPath, { readonly: true });
+    const indexes = migratedDb
+      .query("PRAGMA index_list('agent_executions')")
+      .all() as Array<Record<string, unknown>>;
+    migratedDb.close(false);
+    expect(
+      indexes.some((index) => index.name === "idx_agent_executions_run"),
     ).toBe(true);
 
     store.close();
@@ -512,6 +592,7 @@ describe("SqliteStore", () => {
       store.withTransaction((tx) => {
         tx.loops.upsert({
           id: "loop_rollback",
+          seq: 1,
           projectId: "project_1",
           type: "worker",
           targetType: "project",
@@ -598,6 +679,7 @@ describe("SqliteStore", () => {
     });
     store.loops.upsert({
       id: "loop_paused",
+      seq: 1,
       projectId: "project_1",
       type: "worker",
       targetType: "project",
@@ -674,6 +756,128 @@ describe("SqliteStore", () => {
     store.close();
   });
 
+  test("requeues running queue items by loop and clears claims", async () => {
+    const fixture = await createStoreFixture();
+    const store = new SqliteStore({ dbPath: fixture.dbPath });
+    store.initialize({ autoMigrate: true });
+
+    const now = "2026-04-11T12:00:00.000Z";
+    store.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: "/tmp/looper",
+      baseBranch: "main",
+      archived: false,
+      metadataJson: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.loops.upsert({
+      id: "loop_1",
+      seq: 1,
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: now,
+      nextRunAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.loops.upsert({
+      id: "loop_2",
+      seq: 2,
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:43",
+      repo: "acme/looper",
+      prNumber: 43,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: now,
+      nextRunAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    store.queue.upsert({
+      id: "queue_running_1",
+      projectId: "project_1",
+      loopId: "loop_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      dedupeKey: "reviewer:acme/looper:42",
+      priority: 2,
+      status: "running",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: "executor-1",
+      claimedAt: now,
+      startedAt: now,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:42",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.queue.upsert({
+      id: "queue_running_other_loop",
+      projectId: "project_1",
+      loopId: "loop_2",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:43",
+      repo: "acme/looper",
+      prNumber: 43,
+      dedupeKey: "reviewer:acme/looper:43",
+      priority: 2,
+      status: "running",
+      availableAt: now,
+      attempts: 0,
+      maxAttempts: 3,
+      claimedBy: "executor-2",
+      claimedAt: now,
+      startedAt: now,
+      finishedAt: null,
+      lockKey: "pr:acme/looper:43",
+      payloadJson: null,
+      lastError: null,
+      lastErrorKind: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(
+      store.queue.requeueRunningByLoop("loop_1", "2026-04-11T12:01:00.000Z"),
+    ).toBe(1);
+    expect(store.queue.getById("queue_running_1")).toMatchObject({
+      status: "queued",
+      availableAt: "2026-04-11T12:01:00.000Z",
+      claimedBy: null,
+      claimedAt: null,
+      startedAt: null,
+      finishedAt: null,
+    });
+    expect(store.queue.getById("queue_running_other_loop")?.status).toBe(
+      "running",
+    );
+
+    store.close();
+  });
+
   test("lists runs by status in stable newest-first order", async () => {
     const fixture = await createStoreFixture();
     const store = new SqliteStore({ dbPath: fixture.dbPath });
@@ -691,6 +895,7 @@ describe("SqliteStore", () => {
     });
     store.loops.upsert({
       id: "loop_1",
+      seq: 1,
       projectId: "project_1",
       type: "worker",
       targetType: "project",

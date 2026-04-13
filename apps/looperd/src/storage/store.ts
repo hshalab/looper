@@ -26,12 +26,15 @@ export interface Store {
   loops: {
     upsert(record: LoopRecord): void;
     getById(id: string): LoopRecord | null;
+    getBySeq(seq: number): LoopRecord | null;
+    allocateSeq(): number;
     list(): LoopRecord[];
   };
 
   runs: {
     upsert(record: RunRecord): void;
     getById(id: string): RunRecord | null;
+    getLatestByLoopId(loopId: string): RunRecord | null;
     list(): RunRecord[];
     listByStatus(status: RunRecord["status"]): RunRecord[];
     listByLoop(loopId: string): RunRecord[];
@@ -84,13 +87,16 @@ export interface Store {
       errorKind: QueueFailureKind;
       updatedAt: string;
     }): void;
+    requeueRunningByLoop(loopId: string, queuedAt: string): number;
     cancelByLoop(loopId: string, finishedAt: string, reason?: string): number;
   };
 
   agentExecutions: {
     upsert(record: AgentExecutionRecord): void;
     getById(id: string): AgentExecutionRecord | null;
+    getLatestByRunId(runId: string): AgentExecutionRecord | null;
     list(): AgentExecutionRecord[];
+    listByRunId(runId: string): AgentExecutionRecord[];
     listActive(): AgentExecutionRecord[];
   };
 

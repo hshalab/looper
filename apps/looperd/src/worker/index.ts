@@ -961,6 +961,7 @@ export class WorkerLoopRunner {
 
     const loop: LoopRecord = {
       id: randomUUID(),
+      seq: this.options.store.loops.allocateSeq(),
       projectId: input.projectId,
       type: "worker",
       targetType: "pull_request",

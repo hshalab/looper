@@ -60,22 +60,10 @@ describe("runCli", () => {
         stdout: () => {},
         loadConfigImpl: async () => createConfig() as never,
         fetchImpl: async (input, init) => {
-          const url = String(input);
           requests.push({
-            url,
+            url: String(input),
             body: init?.body as string | null,
           });
-          if (url.endsWith("/api/v1/projects")) {
-            return new Response(
-              JSON.stringify({
-                ok: true,
-                requestId: "req_projects_create_mode",
-                data: {
-                  items: [{ id: "project_1", repoPath: "/tmp/project" }],
-                },
-              }),
-            );
-          }
           return new Response(
             JSON.stringify({
               ok: true,
@@ -88,442 +76,10 @@ describe("runCli", () => {
     );
 
     expect(exitCode).toBe(0);
-    expect(requests).toHaveLength(2);
-    expect(requests[1]?.url).toContain("/api/v1/workers");
-    expect(requests[1]?.body).toContain('"prompt":"Implement CLI flow"');
-    expect(requests[1]?.body).toContain('"specPath":"spec.md"');
-  });
-
-  test("infers project from cwd for work create mode", async () => {
-    const requests: Array<{
-      method: string;
-      url: string;
-      body?: string | null;
-    }> = [];
-    const exitCode = await runCli(
-      [
-        "work",
-        "--spec",
-        "spec.md",
-        "--prompt",
-        "Implement CLI flow",
-        "--repo",
-        "acme/looper",
-        "--base-branch",
-        "main",
-      ],
-      {
-        cwd: "/tmp/repos/looper/packages/cli",
-        stdout: () => {},
-        loadConfigImpl: async () => createConfig() as never,
-        fetchImpl: async (input, init) => {
-          const url = String(input);
-          requests.push({
-            method: init?.method ?? "GET",
-            url,
-            body: init?.body as string | null,
-          });
-
-          if (url.endsWith("/api/v1/projects")) {
-            return new Response(
-              JSON.stringify({
-                ok: true,
-                requestId: "req_projects_1",
-                data: {
-                  items: [
-                    {
-                      id: "project_inferred",
-                      repoPath: "/tmp/repos/looper",
-                    },
-                  ],
-                },
-              }),
-            );
-          }
-
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_worker_inferred",
-              data: {
-                id: "loop_2",
-                title: "Implement CLI flow",
-                status: "running",
-              },
-            }),
-          );
-        },
-      },
-    );
-
-    expect(exitCode).toBe(0);
-    expect(requests[0]?.url).toContain("/api/v1/projects");
-    expect(requests[1]?.url).toContain("/api/v1/workers");
-    expect(requests[1]?.body).toContain('"projectId":"project_inferred"');
-  });
-
-  test("prefers a unique --repo match over an ambiguous cwd match", async () => {
-    let workerRequestCount = 0;
-    const exitCode = await runCli(
-      [
-        "work",
-        "--spec",
-        "spec.md",
-        "--prompt",
-        "Implement CLI flow",
-        "--repo",
-        "acme/looper",
-        "--base-branch",
-        "main",
-      ],
-      {
-        cwd: "/tmp/repos/looper",
-        stdout: () => {},
-        stderr: () => {},
-        loadConfigImpl: async () => createConfig() as never,
-        fetchImpl: async (input) => {
-          const url = String(input);
-          if (url.endsWith("/api/v1/projects")) {
-            return new Response(
-              JSON.stringify({
-                ok: true,
-                requestId: "req_projects_ambiguous_cwd",
-                data: {
-                  items: [
-                    {
-                      id: "project_1",
-                      repoPath: "/tmp/repos/project-one",
-                      repo: "acme/looper",
-                      worktreeRoot: "/tmp/repos/looper",
-                    },
-                    {
-                      id: "project_2",
-                      repoPath: "/tmp/repos/project-two",
-                      repo: "acme/looper-alt",
-                      worktreeRoot: "/tmp/repos/looper",
-                    },
-                  ],
-                },
-              }),
-            );
-          }
-
-          workerRequestCount += 1;
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_worker_repo_match",
-              data: {
-                id: "loop_repo_match",
-                title: "Implement CLI flow",
-                status: "running",
-              },
-            }),
-          );
-        },
-      },
-    );
-
-    expect(exitCode).toBe(0);
-    expect(workerRequestCount).toBe(1);
-  });
-
-  test("fails work create when --repo has no matching project instead of falling back to cwd", async () => {
-    let workerRequestCount = 0;
-    const exitCode = await runCli(
-      [
-        "work",
-        "--spec",
-        "spec.md",
-        "--prompt",
-        "Implement CLI flow",
-        "--repo",
-        "acme/other",
-        "--base-branch",
-        "main",
-      ],
-      {
-        cwd: "/tmp/repos/looper/packages/cli",
-        stdout: () => {},
-        stderr: () => {},
-        loadConfigImpl: async () => createConfig() as never,
-        fetchImpl: async (input) => {
-          const url = String(input);
-          if (url.endsWith("/api/v1/projects")) {
-            return new Response(
-              JSON.stringify({
-                ok: true,
-                requestId: "req_projects_missing_repo_hint",
-                data: {
-                  items: [
-                    {
-                      id: "project_cwd",
-                      repoPath: "/tmp/repos/looper",
-                      repo: "acme/looper",
-                    },
-                  ],
-                },
-              }),
-            );
-          }
-
-          workerRequestCount += 1;
-          return new Response(
-            JSON.stringify({ ok: true, requestId: "unexpected" }),
-          );
-        },
-      },
-    );
-
-    expect(exitCode).toBe(1);
-    expect(workerRequestCount).toBe(0);
-  });
-
-  test("creates worker from numeric --pr input", async () => {
-    const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(["work", "--pr", "42"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input, init) => {
-        const url = String(input);
-        requests.push({
-          url,
-          body: init?.body as string | null,
-        });
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_projects_2",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/looper",
-                    repo: "acme/looper",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            requestId: "req_worker_pr",
-            data: {
-              id: "loop_worker_pr",
-              title: "Implement acme/looper#42",
-              status: "running",
-            },
-          }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(0);
-    expect(requests[1]?.url).toContain("/api/v1/workers");
-    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
-    expect(requests[1]?.body).toContain('"prNumber":42');
-  });
-
-  test("creates worker from qualified --pr input", async () => {
-    const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(["work", "--pr", "acme/looper#42"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input, init) => {
-        const url = String(input);
-        requests.push({
-          url,
-          body: init?.body as string | null,
-        });
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_projects_qualified_pr",
-              data: {
-                items: [{ id: "project_1", repoPath: "/tmp/repos/looper" }],
-              },
-            }),
-          );
-        }
-
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            requestId: "req_worker_qualified_pr",
-            data: {
-              id: "loop_worker_pr_qualified",
-              title: "Implement acme/looper#42",
-              status: "running",
-            },
-          }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(0);
-    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
-    expect(requests[1]?.body).toContain('"prNumber":42');
-  });
-
-  test("creates worker from numeric --issue input", async () => {
-    const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(["work", "--issue", "123"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input, init) => {
-        const url = String(input);
-        requests.push({
-          url,
-          body: init?.body as string | null,
-        });
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_projects_3",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/looper",
-                    repo: "acme/looper",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            requestId: "req_worker_issue",
-            data: {
-              id: "loop_worker_issue",
-              title: "Implement acme/looper#123",
-              status: "running",
-            },
-          }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(0);
-    expect(requests[1]?.url).toContain("/api/v1/workers");
-    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
-    expect(requests[1]?.body).toContain('"issueNumber":123');
-  });
-
-  test("creates worker from qualified --issue input", async () => {
-    const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(["work", "--issue", "acme/looper#123"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input, init) => {
-        const url = String(input);
-        requests.push({
-          url,
-          body: init?.body as string | null,
-        });
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_projects_qualified_issue",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/looper",
-                    repo: "acme/looper",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            requestId: "req_worker_qualified_issue",
-            data: {
-              id: "loop_worker_issue_qualified",
-              title: "Implement acme/looper#123",
-              status: "running",
-            },
-          }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(0);
-    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
-    expect(requests[1]?.body).toContain('"issueNumber":123');
-  });
-
-  test("prefers qualified issue repo over cwd project", async () => {
-    const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(["work", "--issue", "acme/other#123"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input, init) => {
-        const url = String(input);
-        requests.push({
-          url,
-          body: init?.body as string | null,
-        });
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_projects_qualified_issue_repo_priority",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/looper",
-                    repo: "acme/looper",
-                  },
-                  {
-                    id: "project_2",
-                    repoPath: "/tmp/repos/other",
-                    repo: "acme/other",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            requestId: "req_worker_qualified_issue_repo_priority",
-            data: {
-              id: "loop_worker_issue_repo_priority",
-              title: "Implement acme/other#123",
-              status: "running",
-            },
-          }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(0);
-    expect(requests[1]?.body).toContain('"projectId":"project_2"');
-    expect(requests[1]?.body).toContain('"repo":"acme/other"');
-    expect(requests[1]?.body).toContain('"issueNumber":123');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toContain("/api/v1/workers");
+    expect(requests[0]?.body).toContain('"prompt":"Implement CLI flow"');
+    expect(requests[0]?.body).toContain('"specPath":"spec.md"');
   });
 
   test("creates reviewer loop from PR reference", async () => {
@@ -569,321 +125,36 @@ describe("runCli", () => {
     expect(requests[1]).toContain("POST http://127.0.0.1:4310/api/v1/loops");
   });
 
-  test("creates planner work item from numeric issue reference", async () => {
+  test("creates planner work item from issue number", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(["plan", "123"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input, init) => {
-        const url = String(input);
-        requests.push({
-          url,
-          body: init?.body as string | null,
-        });
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_plan_projects_1",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/looper",
-                    repo: "acme/looper",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            requestId: "req_plan_1",
-            data: {
-              id: "loop_plan_1",
-              issueNumber: 123,
-              status: "running",
-            },
-          }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(0);
-    expect(requests[1]?.url).toContain("/api/v1/planners");
-    expect(requests[1]?.body).toContain('"projectId":"project_1"');
-    expect(requests[1]?.body).toContain('"issueNumber":123');
-  });
-
-  test("creates planner work item from qualified issue reference", async () => {
-    const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(["plan", "acme/looper#123"], {
-      cwd: "/tmp/elsewhere",
-      stdout: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input, init) => {
-        const url = String(input);
-        requests.push({
-          url,
-          body: init?.body as string | null,
-        });
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_plan_projects_2",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/looper",
-                    repo: "acme/looper",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            requestId: "req_plan_2",
-            data: {
-              id: "loop_plan_2",
-              issueNumber: 123,
-              status: "running",
-            },
-          }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(0);
-    expect(requests[1]?.url).toContain("/api/v1/planners");
-    expect(requests[1]?.body).toContain('"projectId":"project_1"');
-    expect(requests[1]?.body).toContain('"issueNumber":123');
-  });
-
-  test("prefers qualified planner issue repo over cwd project", async () => {
-    const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(["plan", "acme/other#123"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input, init) => {
-        const url = String(input);
-        requests.push({
-          url,
-          body: init?.body as string | null,
-        });
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_plan_projects_repo_priority",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/looper",
-                    repo: "acme/looper",
-                  },
-                  {
-                    id: "project_2",
-                    repoPath: "/tmp/repos/other",
-                    repo: "acme/other",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            requestId: "req_plan_repo_priority",
-            data: {
-              id: "loop_plan_repo_priority",
-              issueNumber: 123,
-              status: "running",
-            },
-          }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(0);
-    expect(requests[1]?.url).toContain("/api/v1/planners");
-    expect(requests[1]?.body).toContain('"projectId":"project_2"');
-    expect(requests[1]?.body).toContain('"issueNumber":123');
-  });
-
-  test("rejects explicit project when qualified issue repo does not match", async () => {
-    let workerRequestCount = 0;
     const exitCode = await runCli(
-      ["work", "--issue", "acme/other#123", "--project", "project_1"],
+      ["plan", "--project", "project_1", "--issue", "123"],
       {
-        cwd: "/tmp/repos/looper",
         stdout: () => {},
-        stderr: () => {},
         loadConfigImpl: async () => createConfig() as never,
-        fetchImpl: async (input) => {
-          const url = String(input);
-          if (url.endsWith("/api/v1/projects")) {
-            return new Response(
-              JSON.stringify({
-                ok: true,
-                requestId: "req_projects_explicit_mismatch_issue",
-                data: {
-                  items: [
-                    {
-                      id: "project_1",
-                      repoPath: "/tmp/repos/looper",
-                      repo: "acme/looper",
-                    },
-                  ],
-                },
-              }),
-            );
-          }
-
-          workerRequestCount += 1;
+        fetchImpl: async (input, init) => {
+          requests.push({
+            url: String(input),
+            body: init?.body as string | null,
+          });
           return new Response(
-            JSON.stringify({ ok: true, requestId: "unexpected" }),
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_1",
+              data: {
+                id: "loop_plan_1",
+                issueNumber: 123,
+                status: "running",
+              },
+            }),
           );
         },
       },
     );
 
-    expect(exitCode).toBe(1);
-    expect(workerRequestCount).toBe(0);
-  });
-
-  test("fails planner creation when qualified issue repo has no matching project", async () => {
-    let plannerRequestCount = 0;
-    const exitCode = await runCli(["plan", "acme/other#123"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      stderr: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input) => {
-        const url = String(input);
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_plan_projects_missing_qualified_repo",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/looper",
-                    repo: "acme/looper",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-
-        plannerRequestCount += 1;
-        return new Response(
-          JSON.stringify({ ok: true, requestId: "unexpected" }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(1);
-    expect(plannerRequestCount).toBe(0);
-  });
-
-  test("fails planner creation when cwd matches multiple projects equally", async () => {
-    let plannerRequestCount = 0;
-    const exitCode = await runCli(["plan", "123"], {
-      cwd: "/tmp/repos/looper",
-      stdout: () => {},
-      stderr: () => {},
-      loadConfigImpl: async () => createConfig() as never,
-      fetchImpl: async (input) => {
-        const url = String(input);
-        if (url.endsWith("/api/v1/projects")) {
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              requestId: "req_plan_projects_ambiguous_cwd",
-              data: {
-                items: [
-                  {
-                    id: "project_1",
-                    repoPath: "/tmp/repos/project-one",
-                    repo: "acme/looper",
-                    worktreeRoot: "/tmp/repos/looper",
-                  },
-                  {
-                    id: "project_2",
-                    repoPath: "/tmp/repos/project-two",
-                    repo: "acme/looper-alt",
-                    worktreeRoot: "/tmp/repos/looper",
-                  },
-                ],
-              },
-            }),
-          );
-        }
-
-        plannerRequestCount += 1;
-        return new Response(
-          JSON.stringify({ ok: true, requestId: "unexpected" }),
-        );
-      },
-    });
-
-    expect(exitCode).toBe(1);
-    expect(plannerRequestCount).toBe(0);
-  });
-
-  test("rejects explicit project when qualified planner issue repo does not match", async () => {
-    let plannerRequestCount = 0;
-    const exitCode = await runCli(
-      ["plan", "acme/other#123", "--project", "project_1"],
-      {
-        cwd: "/tmp/repos/looper",
-        stdout: () => {},
-        stderr: () => {},
-        loadConfigImpl: async () => createConfig() as never,
-        fetchImpl: async (input) => {
-          const url = String(input);
-          if (url.endsWith("/api/v1/projects")) {
-            return new Response(
-              JSON.stringify({
-                ok: true,
-                requestId: "req_plan_projects_explicit_mismatch",
-                data: {
-                  items: [
-                    {
-                      id: "project_1",
-                      repoPath: "/tmp/repos/looper",
-                      repo: "acme/looper",
-                    },
-                  ],
-                },
-              }),
-            );
-          }
-
-          plannerRequestCount += 1;
-          return new Response(
-            JSON.stringify({ ok: true, requestId: "unexpected" }),
-          );
-        },
-      },
-    );
-
-    expect(exitCode).toBe(1);
-    expect(plannerRequestCount).toBe(0);
+    expect(exitCode).toBe(0);
+    expect(requests[0]?.url).toContain("/api/v1/planners");
+    expect(requests[0]?.body).toContain('"issueNumber":123');
   });
 
   test("adds project and requests discovery", async () => {
@@ -1124,7 +395,7 @@ describe("runCli", () => {
       expect(exitCode).toBe(0);
       expect(lines[0]).toContain("type");
       expect(lines[0]).toContain("target");
-      expect(lines[0]).toContain("run");
+      expect(lines[0]).toContain("#");
       expect(lines[0]).toContain("step");
       expect(lines[0]).toContain("agent");
       expect(lines[0]).toContain("pid");
@@ -1132,7 +403,6 @@ describe("runCli", () => {
       expect(lines[0]).toContain("age");
       expect(lines[2]).toContain("worker");
       expect(lines[2]).toContain("project_1");
-      expect(lines[2]).toContain("run_worker_1");
       expect(lines[2]).toContain("execute");
       expect(lines[2]).toContain("opencode");
       expect(lines[2]).toContain("2222");
@@ -1186,5 +456,297 @@ describe("runCli", () => {
     expect(requests[0]).toContain(
       "/api/v1/runs/active?type=reviewer&projectId=project_1",
     );
+  });
+
+  test("supports jump output modes", async () => {
+    const requests: string[] = [];
+    const fetchImpl = (async (input) => {
+      requests.push(String(input));
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          requestId: "req_jump",
+          data: {
+            seq: 12,
+            loopId: "loop_12",
+            projectId: "project_1",
+            worktree: {
+              id: "wt_12",
+              path: "/tmp/looper-worktrees/loop-12",
+              branch: "feature/loop-12",
+            },
+          },
+        }),
+      );
+    }) as typeof fetch;
+
+    const defaultLines: string[] = [];
+    const defaultExit = await runCli(["jump", "12"], {
+      isStdoutTty: false,
+      stdout: (line) => defaultLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl,
+    });
+    expect(defaultExit).toBe(0);
+    expect(defaultLines.at(-1)).toBe("cd -- '/tmp/looper-worktrees/loop-12'");
+
+    const pathLines: string[] = [];
+    const pathExit = await runCli(["jump", "12", "--print-path"], {
+      isStdoutTty: false,
+      stdout: (line) => pathLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl,
+    });
+    expect(pathExit).toBe(0);
+    expect(pathLines).toEqual(["/tmp/looper-worktrees/loop-12"]);
+
+    const jsonLines: string[] = [];
+    const jsonExit = await runCli(["jump", "12", "--json"], {
+      isStdoutTty: false,
+      stdout: (line) => jsonLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl,
+    });
+    expect(jsonExit).toBe(0);
+    expect(jsonLines.join("\n")).toContain('"seq": 12');
+    expect(jsonLines.join("\n")).toContain(
+      '"path": "/tmp/looper-worktrees/loop-12"',
+    );
+
+    const shellLines: string[] = [];
+    const shellExit = await runCli(
+      ["jump", "12", "--shell-integration", "bash"],
+      {
+        isStdoutTty: false,
+        stdout: (line) => shellLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      },
+    );
+    expect(shellExit).toBe(0);
+    expect(shellLines).toEqual(['lj() { eval "$(looper jump "$@")"; }']);
+
+    const shellNoIdLines: string[] = [];
+    const shellNoIdExit = await runCli(
+      ["jump", "--shell-integration", "bash"],
+      {
+        isStdoutTty: false,
+        stdout: (line) => shellNoIdLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      },
+    );
+    expect(shellNoIdExit).toBe(0);
+    expect(shellNoIdLines).toEqual(['lj() { eval "$(looper jump "$@")"; }']);
+
+    expect(requests).toHaveLength(3);
+    expect(requests[0]).toContain("/api/v1/runs/active/12");
+  });
+
+  test("jump opens an interactive shell when stdout is a tty", async () => {
+    const launched: Array<{ cwd: string; shell?: string }> = [];
+    const exitCode = await runCli(["jump", "12"], {
+      env: { SHELL: "/bin/zsh" },
+      isStdoutTty: true,
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_jump_tty",
+            data: {
+              seq: 12,
+              loopId: "loop_12",
+              projectId: "project_1",
+              worktree: {
+                id: "wt_12",
+                path: "/tmp/looper-worktrees/loop-12",
+                branch: "feature/loop-12",
+              },
+            },
+          }),
+        ),
+      launchShellImpl: async (options) => {
+        launched.push({ cwd: options.cwd, shell: options.env.SHELL });
+        return 0;
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(launched).toEqual([
+      {
+        cwd: "/tmp/looper-worktrees/loop-12",
+        shell: "/bin/zsh",
+      },
+    ]);
+  });
+
+  test("supports logs output modes and no-agent message", async () => {
+    const requests: string[] = [];
+    const fetchImpl = (async (input) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith("/api/v1/loops/99/logs")) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_logs_empty",
+            data: {
+              seq: 99,
+              loopId: "loop_99",
+              loopType: "worker",
+              loopStatus: "running",
+              run: null,
+              agent: null,
+            },
+          }),
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          requestId: "req_logs",
+          data: {
+            seq: 12,
+            loopId: "loop_12",
+            loopType: "worker",
+            loopStatus: "running",
+            run: {
+              runId: "run_12",
+              status: "running",
+              currentStep: "execute",
+            },
+            agent: {
+              executionId: "agent_12",
+              vendor: "opencode",
+              status: "running",
+              pid: 888,
+              stdout: "one\ntwo\nthree\n",
+              stderr: "err-one\nerr-two\n",
+            },
+          },
+        }),
+      );
+    }) as typeof fetch;
+
+    const defaultLines: string[] = [];
+    expect(
+      await runCli(["logs", "12"], {
+        stdout: (line) => defaultLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(defaultLines.join("\n")).toContain("Loop #12 · worker · running");
+    expect(defaultLines.join("\n")).toContain("three");
+
+    const stderrLines: string[] = [];
+    expect(
+      await runCli(["logs", "12", "--stderr", "--tail", "1"], {
+        stdout: (line) => stderrLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(stderrLines.join("\n")).toContain("err-two");
+    expect(stderrLines.join("\n")).not.toContain("err-one");
+
+    const fullLines: string[] = [];
+    expect(
+      await runCli(["logs", "12", "--full"], {
+        stdout: (line) => fullLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(fullLines.join("\n")).toContain("one");
+    expect(fullLines.join("\n")).toContain("three");
+
+    const jsonLines: string[] = [];
+    expect(
+      await runCli(["logs", "12", "--json"], {
+        stdout: (line) => jsonLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(jsonLines.join("\n")).toContain('"seq": 12');
+    expect(jsonLines.join("\n")).toContain('"executionId": "agent_12"');
+
+    const noAgentLines: string[] = [];
+    expect(
+      await runCli(["logs", "99"], {
+        stdout: (line) => noAgentLines.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(noAgentLines.join("\n")).toContain(
+      "No agent output for the current step.",
+    );
+  });
+
+  test("stops active run using numeric selector", async () => {
+    const requests: Array<{ url: string; method?: string }> = [];
+    const lines: string[] = [];
+    const exitCode = await runCli(["stop", "12"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        requests.push({ url: String(input), method: init?.method });
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_stop",
+            data: {
+              loopId: "loop_12",
+              runId: "run_12",
+              executionId: "agent_12",
+              vendor: "opencode",
+              pid: 888,
+              stopped: true,
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]).toMatchObject({ method: "POST" });
+    expect(requests[0]?.url).toContain("/api/v1/runs/active/12/stop");
+    expect(lines.join("\n")).toContain("Loop stopped");
+    expect(lines.join("\n")).toContain("loop_12");
+  });
+
+  test("returns a non-zero exit code when stop reports stopped false", async () => {
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const exitCode = await runCli(["stop", "12"], {
+      stdout: (line) => stdoutLines.push(line),
+      stderr: (line) => stderrLines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_stop_failed",
+            data: {
+              loopId: "loop_12",
+              runId: "run_12",
+              executionId: "agent_12",
+              vendor: "opencode",
+              pid: 888,
+              stopped: false,
+            },
+          }),
+        ),
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdoutLines.join("\n")).toContain("Loop stopped");
+    expect(stdoutLines.join("\n")).toContain("stopped     : no");
+    expect(stderrLines.join("\n")).toContain("Loop 12 could not be stopped");
   });
 });

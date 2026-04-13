@@ -319,6 +319,9 @@ class BasicLooperdRuntime implements LooperdRuntime {
         logger: this.options.logger,
         store,
         projects,
+        runtimeControl: {
+          stopLoop: (input) => this.stopLoop(input),
+        },
         getStartedAt: () => this.startedAt,
         getRecoverySummary: () => ({ ...this.recoverySummary }),
       });
@@ -419,6 +422,124 @@ class BasicLooperdRuntime implements LooperdRuntime {
       this.store = undefined;
       this.resolveShutdown();
     }
+  }
+
+  private async stopLoop(input: { loopId: string; reason: string }): Promise<{
+    stopped: boolean;
+    loopId: string;
+    runId?: string;
+    executionId?: string;
+    vendor?: string;
+    pid?: number | null;
+  }> {
+    if (!this.store) {
+      throw new Error("Runtime is not started");
+    }
+
+    const loop = this.store.loops.getById(input.loopId);
+    if (!loop) {
+      throw new Error(`Loop not found: ${input.loopId}`);
+    }
+
+    const nowIso = new Date().toISOString();
+    this.store.loops.upsert({
+      ...loop,
+      status: "paused",
+      nextRunAt: null,
+      updatedAt: nowIso,
+    });
+    const cancelledQueueItems = this.store.queue.cancelByLoop(
+      loop.id,
+      nowIso,
+      input.reason,
+    );
+
+    const activeExecution = this.store.agentExecutions
+      .listActive()
+      .find((execution) => execution.loopId === loop.id);
+    const activeRun = this.store.runs
+      .listByLoop(loop.id)
+      .find((run) => run.status === "running");
+
+    let stopRequested = false;
+    let executionTerminated = false;
+
+    if (activeExecution?.pid) {
+      try {
+        process.kill(activeExecution.pid, "SIGTERM");
+        stopRequested = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          stopRequested = true;
+          executionTerminated = true;
+        } else {
+          this.options.logger.warn("failed to stop active agent execution", {
+            loopId: loop.id,
+            executionId: activeExecution.id,
+            pid: activeExecution.pid,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      this.store.agentExecutions.upsert({
+        ...activeExecution,
+        status: executionTerminated
+          ? "killed"
+          : stopRequested
+            ? "cancelling"
+            : activeExecution.status,
+        errorMessage: stopRequested
+          ? input.reason
+          : activeExecution.errorMessage,
+        endedAt: executionTerminated ? nowIso : activeExecution.endedAt,
+        updatedAt: nowIso,
+      });
+    }
+
+    if (activeRun && executionTerminated) {
+      this.store.runs.upsert({
+        ...activeRun,
+        status: "cancelled",
+        errorMessage: input.reason,
+        endedAt: nowIso,
+        updatedAt: nowIso,
+      });
+    }
+
+    const runStopped = Boolean(activeRun && executionTerminated);
+    const stopped =
+      stopRequested || runStopped || (!activeRun && cancelledQueueItems > 0);
+
+    this.appendEvent({
+      id: randomUUID(),
+      eventType: "loop.stopped",
+      projectId: loop.projectId,
+      loopId: loop.id,
+      runId: activeRun?.id ?? null,
+      entityType: "loop",
+      entityId: loop.id,
+      actorType: "user",
+      actorId: "cli",
+      actorDisplayName: "cli",
+      payloadJson: JSON.stringify({
+        reason: input.reason,
+        executionId: activeExecution?.id,
+        vendor: activeExecution?.vendor,
+        pid: activeExecution?.pid ?? null,
+        stopped,
+      }),
+      createdAt: nowIso,
+    });
+
+    return {
+      stopped,
+      loopId: loop.id,
+      runId: activeRun?.id,
+      executionId: activeExecution?.id,
+      vendor: activeExecution?.vendor,
+      pid: activeExecution?.pid ?? null,
+    };
   }
 
   public async waitForShutdown(): Promise<void> {
@@ -547,6 +668,10 @@ class BasicLooperdRuntime implements LooperdRuntime {
           lastRunAt: latestRun.endedAt ?? latestRun.startedAt,
           updatedAt: nowIso,
         });
+        const recoveredQueueItems = this.store.queue.requeueRunningByLoop(
+          loop.id,
+          nowIso,
+        );
         summary.loopsRequeued += 1;
         this.appendEvent({
           id: randomUUID(),
@@ -557,6 +682,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
           payloadJson: JSON.stringify({
             previousStatus: loop.status,
             nextRunAt: nowIso,
+            recoveredQueueItems,
           }),
           createdAt: nowIso,
         });
