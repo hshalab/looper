@@ -10,6 +10,7 @@ import { appendCompletionInstruction } from "../infra/agent-prompt";
 import { CommandExecutionError, runCommand } from "../infra/command";
 import { ProtectedBranchError } from "../infra/git";
 import type {
+  GitHubIssueDetail,
   GitHubPullRequestDetail,
   GitHubPullRequestSummary,
 } from "../infra/github";
@@ -36,6 +37,9 @@ const WORKER_STEP_SEQUENCE = [
   "validate",
   "open-pr",
 ] as const;
+
+const WORKER_BRANCH_SLUG_MAX_LENGTH = 48;
+const WORKER_PR_DEDUPE_LOOKUP_LIMIT = 1000;
 
 export type WorkerStep = (typeof WORKER_STEP_SEQUENCE)[number];
 
@@ -78,6 +82,11 @@ export interface WorkerGitHubGateway {
     prNumber: number;
     cwd?: string;
   }): Promise<GitHubPullRequestDetail>;
+  viewIssue(input: {
+    repo: string;
+    issueNumber: number;
+    cwd?: string;
+  }): Promise<GitHubIssueDetail>;
   createPullRequest(input: {
     repo: string;
     headBranch: string;
@@ -160,6 +169,8 @@ interface WorkerInput {
   repo: string;
   baseBranch: string;
   executionMode: "create-pr" | "push-existing";
+  issueNumber?: number;
+  issueUrl?: string;
   prNumber?: number;
   branch?: string;
   headSha?: string;
@@ -511,6 +522,19 @@ export class WorkerLoopRunner {
         input.loop.metadataJson,
         input.loop,
       );
+    if (
+      work.executionMode === "create-pr" &&
+      work.issueNumber &&
+      !work.prompt &&
+      !work.specPath
+    ) {
+      const issue = await this.options.github.viewIssue({
+        repo: work.repo,
+        issueNumber: work.issueNumber,
+        cwd: input.project.repoPath,
+      });
+      work = hydrateWorkerInputFromIssue(work, issue);
+    }
     if (input.loop.targetType === "pull_request") {
       const repo = input.loop.repo ?? input.queueItem.repo;
       const prNumber = input.loop.prNumber ?? input.queueItem.prNumber;
@@ -602,7 +626,7 @@ export class WorkerLoopRunner {
     const branch =
       work.executionMode === "push-existing"
         ? (work.branch ?? `pr-${work.prNumber}`)
-        : `looper/worker/${slugify(input.loop.id)}`;
+        : buildWorkerBranchName(work, input.loop.id);
     const worktree = await this.options.git.createWorktree({
       projectId: input.project.id,
       repoPath: input.project.repoPath,
@@ -692,6 +716,7 @@ export class WorkerLoopRunner {
       repoRootPath: worktree.path,
       work,
       plan: input.checkpoint.plan?.items ?? [],
+      allowAgentPrCreation: this.canAgentCreatePr(work),
     });
     const executionId = randomUUID();
     const execution = await this.options.agentExecutor.start({
@@ -831,11 +856,68 @@ export class WorkerLoopRunner {
     }
 
     try {
+      const existingPullRequest = await this.findOpenPullRequestForBranch({
+        repo: work.repo,
+        branch: worktree.branch,
+        baseBranch: work.baseBranch,
+        cwd: input.project.repoPath,
+      });
+      if (existingPullRequest) {
+        await this.options.git.push({
+          worktreePath: worktree.path,
+          branch: worktree.branch,
+          protectedBranches: [work.baseBranch],
+        });
+        await this.assignReviewersIfNeeded({
+          work,
+          pullRequest: existingPullRequest,
+          cwd: input.project.repoPath,
+        });
+        this.persistPullRequestReference(
+          input.loop,
+          work.repo,
+          existingPullRequest,
+        );
+        return {
+          ...input.checkpoint,
+          pullRequest: {
+            number: existingPullRequest.number,
+            url: existingPullRequest.url ?? "",
+          },
+          resumePolicy: "advance_from_checkpoint",
+        };
+      }
       await this.options.git.push({
         worktreePath: worktree.path,
         branch: worktree.branch,
         protectedBranches: [work.baseBranch],
       });
+      const discoveredPullRequest = await this.findOpenPullRequestForBranch({
+        repo: work.repo,
+        branch: worktree.branch,
+        baseBranch: work.baseBranch,
+        cwd: input.project.repoPath,
+      });
+      if (discoveredPullRequest) {
+        await this.assignReviewersIfNeeded({
+          work,
+          pullRequest: discoveredPullRequest,
+          cwd: input.project.repoPath,
+        });
+        this.persistPullRequestReference(
+          input.loop,
+          work.repo,
+          discoveredPullRequest,
+        );
+        return {
+          ...input.checkpoint,
+          pullRequest: {
+            number: discoveredPullRequest.number,
+            url: discoveredPullRequest.url ?? "",
+          },
+          resumePolicy: "advance_from_checkpoint",
+        };
+      }
       const pullRequest = await this.options.github.createPullRequest({
         repo: work.repo,
         headBranch: worktree.branch,
@@ -848,15 +930,13 @@ export class WorkerLoopRunner {
         }),
         cwd: input.project.repoPath,
       });
+      await this.assignReviewersIfNeeded({
+        work,
+        pullRequest,
+        cwd: input.project.repoPath,
+      });
 
-      this.updateLoop(input.loop, {
-        repo: work.repo,
-        prNumber: pullRequest.number ?? null,
-      });
-      this.updateLoopMetadata(input.loop.id, {
-        prUrl: pullRequest.url,
-        prNumber: pullRequest.number ?? null,
-      });
+      this.persistPullRequestReference(input.loop, work.repo, pullRequest);
 
       return {
         ...input.checkpoint,
@@ -869,6 +949,59 @@ export class WorkerLoopRunner {
         "retryable_after_resume",
       );
     }
+  }
+
+  private async assignReviewersIfNeeded(input: {
+    work: WorkerInput;
+    pullRequest: {
+      number?: number;
+    };
+    cwd: string;
+  }): Promise<void> {
+    if (
+      (input.work.reviewers ?? []).length === 0 ||
+      !input.pullRequest.number
+    ) {
+      return;
+    }
+
+    await this.options.github.addPullRequestReviewers({
+      repo: input.work.repo,
+      prNumber: input.pullRequest.number,
+      reviewers: input.work.reviewers ?? [],
+      cwd: input.cwd,
+    });
+  }
+
+  private canAgentCreatePr(work: WorkerInput): boolean {
+    return (
+      work.executionMode === "create-pr" &&
+      this.openPrStrategy !== "manual" &&
+      this.allowAutoPush &&
+      this.validationCommands.length === 0 &&
+      !this.options.validationRunner
+    );
+  }
+
+  private async findOpenPullRequestForBranch(input: {
+    repo: string;
+    branch: string;
+    baseBranch: string;
+    cwd: string;
+  }): Promise<GitHubPullRequestSummary | null> {
+    const pullRequests = await this.options.github.listOpenPullRequests({
+      repo: input.repo,
+      cwd: input.cwd,
+      limit: WORKER_PR_DEDUPE_LOOKUP_LIMIT,
+    });
+    return (
+      pullRequests.find(
+        (pullRequest) =>
+          normalizePrState(pullRequest.state) === "open" &&
+          pullRequest.headRefName === input.branch &&
+          pullRequest.baseRefName === input.baseBranch,
+      ) ?? null
+    );
   }
 
   private resolveWorkerInput(
@@ -897,7 +1030,12 @@ export class WorkerLoopRunner {
       (executionMode === "push-existing"
         ? (readString(parseJsonObject(loop?.metadataJson).baseBranch) ?? "main")
         : null);
-    if (executionMode === "create-pr" && !prompt && !specPath) {
+    if (
+      executionMode === "create-pr" &&
+      !prompt &&
+      !specPath &&
+      !readNumber(source.issueNumber)
+    ) {
       throw new WorkerLoopError(
         "worker.prompt or worker.specPath is required",
         "non_retryable",
@@ -920,6 +1058,8 @@ export class WorkerLoopRunner {
       prompt,
       specPath,
       executionMode,
+      issueNumber: readNumber(source.issueNumber),
+      issueUrl: readString(source.issueUrl) ?? undefined,
       prNumber: readNumber(source.prNumber),
       branch: readString(source.branch) ?? undefined,
       headSha: readString(source.headSha) ?? undefined,
@@ -1254,6 +1394,24 @@ export class WorkerLoopRunner {
   private nowIso(): string {
     return this.now().toISOString();
   }
+
+  private persistPullRequestReference(
+    loop: LoopRecord,
+    repo: string,
+    pullRequest: {
+      number?: number;
+      url?: string;
+    },
+  ): void {
+    this.updateLoop(loop, {
+      repo,
+      prNumber: pullRequest.number ?? null,
+    });
+    this.updateLoopMetadata(loop.id, {
+      prUrl: pullRequest.url ?? null,
+      prNumber: pullRequest.number ?? null,
+    });
+  }
 }
 
 function nextWorkerStep(step: WorkerStep): WorkerStep | null {
@@ -1350,6 +1508,7 @@ async function buildWorkerPrompt(input: {
   repoRootPath: string;
   work: WorkerInput;
   plan: string[];
+  allowAgentPrCreation: boolean;
 }): Promise<string> {
   const specBlock = await readSpecBlock(
     input.repoRootPath,
@@ -1372,11 +1531,30 @@ async function buildWorkerPrompt(input: {
             "\n",
           )
         : null,
-      "Make the necessary code changes, validate them, and leave the branch ready for PR creation.",
+      input.allowAgentPrCreation
+        ? buildAgentPullRequestInstruction(input.work)
+        : null,
+      input.allowAgentPrCreation
+        ? "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state."
+        : "Make the necessary code changes, validate them, and leave the branch ready for PR creation.",
     ]
       .filter((value): value is string => Boolean(value))
       .join("\n\n"),
   );
+}
+
+function buildAgentPullRequestInstruction(work: WorkerInput): string {
+  return [
+    "When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself.",
+    "Before creating a PR, check whether one already exists for the current branch and avoid duplicates.",
+    "Write a concise, accurate PR title and a structured body that explains the actual changes and why they were made.",
+    work.issueNumber
+      ? `Include \`Closes #${work.issueNumber}\` in the PR body.`
+      : null,
+    `Target base branch: ${work.baseBranch}.`,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join("\n");
 }
 
 async function readSpecBlock(
@@ -1409,11 +1587,65 @@ function buildPullRequestBody(input: {
     input.executionSummary
       ? `\n## Agent Summary\n${input.executionSummary}`
       : null,
+    input.work.issueNumber
+      ? `\nIssue: ${input.work.repo}#${input.work.issueNumber}`
+      : null,
+    input.work.issueUrl ? `Issue URL: ${input.work.issueUrl}` : null,
     input.work.specPath ? `\nSpec: ${input.work.specPath}` : null,
     input.work.prompt ? `\nPrompt: ${input.work.prompt}` : null,
+    input.work.issueNumber ? `\nCloses #${input.work.issueNumber}` : null,
   ]
     .filter((value): value is string => Boolean(value))
     .join("\n");
+}
+
+function hydrateWorkerInputFromIssue(
+  work: WorkerInput,
+  issue: GitHubIssueDetail,
+): WorkerInput {
+  const fallbackTitle = buildDefaultIssueWorkerTitle(work.repo, issue.number);
+  return {
+    ...work,
+    title:
+      work.title === "Worker run" || work.title === fallbackTitle
+        ? issue.title
+        : work.title,
+    prompt: buildIssuePrompt(work.repo, issue),
+    issueUrl: issue.url,
+  };
+}
+
+function buildIssuePrompt(repo: string, issue: GitHubIssueDetail): string {
+  return [
+    `Implement GitHub issue ${repo}#${issue.number}: ${issue.title}`,
+    issue.body ? `Issue body:\n${issue.body}` : null,
+    issue.url ? `Issue URL: ${issue.url}` : null,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join("\n\n");
+}
+
+function buildWorkerBranchName(work: WorkerInput, loopId: string): string {
+  if (work.issueNumber) {
+    return `looper/worker/${work.issueNumber}-${buildWorkerSlug(work.title)}-${slugify(loopId)}`;
+  }
+
+  return `looper/worker/${slugify(loopId)}`;
+}
+
+function buildWorkerSlug(title: string): string {
+  const words = slugify(title).split("-").filter(Boolean).slice(0, 8).join("-");
+  return (
+    words.slice(0, WORKER_BRANCH_SLUG_MAX_LENGTH).replace(/-+$/g, "") ||
+    "update"
+  );
+}
+
+function buildDefaultIssueWorkerTitle(
+  repo: string,
+  issueNumber: number,
+): string {
+  return `Implement ${repo}#${issueNumber}`;
 }
 
 function buildPullRequestTargetId(repo: string, prNumber: number): string {

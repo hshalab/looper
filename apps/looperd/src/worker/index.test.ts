@@ -150,7 +150,13 @@ class FakeGitGateway implements WorkerGitGateway {
 }
 
 class FakeGitHubGateway implements WorkerGitHubGateway {
-  public listOpenPullRequestCalls: Array<{ label?: string }> = [];
+  public listOpenPullRequestCalls: Array<{ label?: string; limit?: number }> =
+    [];
+  public viewIssueCalls: Array<{
+    repo: string;
+    issueNumber: number;
+    cwd?: string;
+  }> = [];
   public createPullRequestCalls: Array<{
     repo: string;
     headBranch: string;
@@ -178,7 +184,10 @@ class FakeGitHubGateway implements WorkerGitHubGateway {
   }): Promise<
     Awaited<ReturnType<WorkerGitHubGateway["listOpenPullRequests"]>>
   > {
-    this.listOpenPullRequestCalls.push({ label: input.label });
+    this.listOpenPullRequestCalls.push({
+      label: input.label,
+      limit: input.limit,
+    });
     return [];
   }
 
@@ -205,6 +214,24 @@ class FakeGitHubGateway implements WorkerGitHubGateway {
       comments: [],
       reviews: [],
       checks: [{ conclusion: "SUCCESS" }],
+    };
+  }
+
+  public async viewIssue(input: {
+    repo: string;
+    issueNumber: number;
+    cwd?: string;
+  }) {
+    this.viewIssueCalls.push(input);
+    return {
+      number: input.issueNumber,
+      title: "Add worker issue fallback",
+      body: "Use the issue body as worker prompt when no planner exists.",
+      url: `https://example.test/${input.repo}/issues/${input.issueNumber}`,
+      state: "OPEN",
+      author: "octocat",
+      assignees: [],
+      labels: [],
     };
   }
 
@@ -473,12 +500,413 @@ describe("WorkerLoopRunner", () => {
     expect(result.status).toBe("success");
     expect(result.pullRequestNumber).toBe(101);
     expect(agent.starts).toHaveLength(1);
+    expect(agent.starts[0]?.prompt).not.toContain(
+      "use the GitHub CLI (`gh`) to create the pull request yourself",
+    );
     expect(git.createWorktreeCalls).toBe(1);
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(1);
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe(
       "completed",
     );
+    fixture.store.close();
+  });
+
+  test("prompts agent to create PR only when looperd validation is disabled", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and committed changes", [
+        "abc123",
+      ]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(agent.starts[0]?.prompt).toContain(
+      "use the GitHub CLI (`gh`) to create the pull request yourself",
+    );
+
+    fixture.store.close();
+  });
+
+  test("records agent-created pull requests without creating a duplicate", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async (input) => {
+      github.listOpenPullRequestCalls.push({
+        label: input.label,
+        limit: input.limit,
+      });
+      return [
+        {
+          number: 202,
+          title: "Agent-created PR",
+          url: "https://example.test/acme/looper/pull/202",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: [],
+          headRefName: "looper/worker/loop-worker-1",
+          baseRefName: "main",
+          author: "octocat",
+          reviewRequests: [],
+        },
+      ];
+    };
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and opened PR", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(result.pullRequestNumber).toBe(202);
+    expect(git.pushCalls).toBe(1);
+    expect(github.createPullRequestCalls).toHaveLength(0);
+    expect(github.listOpenPullRequestCalls[0]?.limit).toBe(1000);
+    expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(202);
+    expect(
+      fixture.store.loops.getById("loop_worker_1")?.metadataJson,
+    ).toContain("https://example.test/acme/looper/pull/202");
+
+    fixture.store.close();
+  });
+
+  test("does not reuse an existing PR when the base branch differs", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async (input) => {
+      github.listOpenPullRequestCalls.push({
+        label: input.label,
+        limit: input.limit,
+      });
+      return [
+        {
+          number: 303,
+          title: "Wrong-base PR",
+          url: "https://example.test/acme/looper/pull/303",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: [],
+          headRefName: "looper/worker/loop-worker-1",
+          baseRefName: "develop",
+          author: "octocat",
+          reviewRequests: [],
+        },
+      ];
+    };
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and opened PR", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(result.pullRequestNumber).toBe(101);
+    expect(github.createPullRequestCalls).toHaveLength(1);
+    expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(101);
+
+    fixture.store.close();
+  });
+
+  test("hydrates worker input from issue details and opens a PR without planner", async () => {
+    const fixture = await createFixture();
+    const nowIso = fixture.now.toISOString();
+    fixture.store.loops.upsert({
+      ...(fixture.store.loops.getById("loop_worker_1") ?? {
+        id: "loop_worker_1",
+        seq: 1,
+        projectId: "project_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: null,
+        status: "queued",
+        configJson: null,
+        metadataJson: null,
+        lastRunAt: null,
+        nextRunAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      }),
+      targetType: "project",
+      targetId: "project_1",
+      repo: "acme/looper",
+      prNumber: null,
+      metadataJson: JSON.stringify({
+        worker: {
+          title: "Implement acme/looper#123",
+          repo: "acme/looper",
+          baseBranch: "main",
+          issueNumber: 123,
+        },
+      }),
+      updatedAt: nowIso,
+    });
+    fixture.store.queue.upsert({
+      ...(fixture.store.queue.findActiveByDedupe("worker:loop_worker_1") ?? {
+        id: "queue_issue_mode",
+        projectId: "project_1",
+        loopId: "loop_worker_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: null,
+        dedupeKey: "worker:loop_worker_1",
+        priority: 0,
+        status: "queued",
+        availableAt: nowIso,
+        attempts: 0,
+        maxAttempts: 3,
+        claimedBy: null,
+        claimedAt: null,
+        startedAt: null,
+        finishedAt: null,
+        lockKey: "worker:loop_worker_1",
+        payloadJson: null,
+        lastError: null,
+        lastErrorKind: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      }),
+      targetType: "project",
+      targetId: "project_1",
+      repo: "acme/looper",
+      prNumber: null,
+      lockKey: "worker:loop_worker_1",
+      payloadJson: JSON.stringify({
+        title: "Implement acme/looper#123",
+        repo: "acme/looper",
+        baseBranch: "main",
+        issueNumber: 123,
+      }),
+      updatedAt: nowIso,
+    });
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented issue fallback", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(github.viewIssueCalls).toEqual([
+      {
+        repo: "acme/looper",
+        issueNumber: 123,
+        cwd: fixture.repoPath,
+      },
+    ]);
+    expect(agent.starts).toHaveLength(1);
+    expect(agent.starts[0]?.prompt).toContain(
+      "Implement GitHub issue acme/looper#123: Add worker issue fallback",
+    );
+    expect(git.pushCalls).toBe(1);
+    expect(github.createPullRequestCalls).toHaveLength(1);
+    expect(github.createPullRequestCalls[0]?.headBranch).toBe(
+      "looper/worker/123-add-worker-issue-fallback-loop-worker-1",
+    );
+    expect(github.createPullRequestCalls[0]?.title).toBe(
+      "Add worker issue fallback",
+    );
+    expect(github.createPullRequestCalls[0]?.body).toContain("Closes #123");
+
+    fixture.store.close();
+  });
+
+  test("truncates long issue-derived branch slugs", async () => {
+    const fixture = await createFixture();
+    const nowIso = fixture.now.toISOString();
+    const longTitle = `Implement ${"supercalifragilisticexpialidocious".repeat(6)}`;
+    fixture.store.loops.upsert({
+      ...(fixture.store.loops.getById("loop_worker_1") ?? {
+        id: "loop_worker_1",
+        seq: 1,
+        projectId: "project_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: null,
+        status: "queued",
+        configJson: null,
+        metadataJson: null,
+        lastRunAt: null,
+        nextRunAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      }),
+      metadataJson: JSON.stringify({
+        worker: {
+          title: "Implement acme/looper#124",
+          repo: "acme/looper",
+          baseBranch: "main",
+          issueNumber: 124,
+        },
+      }),
+      updatedAt: nowIso,
+    });
+    fixture.store.queue.upsert({
+      ...(fixture.store.queue.findActiveByDedupe("worker:loop_worker_1") ?? {
+        id: "queue_issue_mode_long",
+        projectId: "project_1",
+        loopId: "loop_worker_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: null,
+        dedupeKey: "worker:loop_worker_1",
+        priority: 0,
+        status: "queued",
+        availableAt: nowIso,
+        attempts: 0,
+        maxAttempts: 3,
+        claimedBy: null,
+        claimedAt: null,
+        startedAt: null,
+        finishedAt: null,
+        lockKey: "worker:loop_worker_1",
+        payloadJson: null,
+        lastError: null,
+        lastErrorKind: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      }),
+      payloadJson: JSON.stringify({
+        title: "Implement acme/looper#124",
+        repo: "acme/looper",
+        baseBranch: "main",
+        issueNumber: 124,
+      }),
+      updatedAt: nowIso,
+    });
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.viewIssue = async (input) => ({
+      number: input.issueNumber,
+      title: longTitle,
+      body: "Long title branch test.",
+      url: `https://example.test/${input.repo}/issues/${input.issueNumber}`,
+      state: "OPEN",
+      author: "octocat",
+      assignees: [],
+      labels: [],
+    });
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented issue fallback", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    const headBranch = github.createPullRequestCalls[0]?.headBranch;
+    expect(headBranch).toBeDefined();
+    expect(headBranch?.length ?? 0).toBeLessThanOrEqual(80);
+    expect(headBranch).toMatch(/^looper\/worker\/124-/);
+    expect(headBranch).toContain("-loop-worker-1");
+
     fixture.store.close();
   });
 
@@ -978,11 +1406,54 @@ describe("WorkerLoopRunner", () => {
     const result = await runner.processClaimedItem(claimed);
     expect(result.status).toBe("skipped");
     expect(result.summary).toContain("Auto push disabled");
+    expect(agent.starts[0]?.prompt).not.toContain(
+      "use the GitHub CLI (`gh`) to create the pull request yourself",
+    );
+    expect(github.listOpenPullRequestCalls).toHaveLength(0);
     expect(git.pushCalls).toBe(0);
     expect(github.createPullRequestCalls).toHaveLength(0);
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe(
       "completed",
     );
+
+    fixture.store.close();
+  });
+
+  test("skips GitHub PR lookup when manual PR opening is configured", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and committed changes", [
+        "abc123",
+      ]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "manual",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("skipped");
+    expect(result.summary).toContain("PR opening is manual");
+    expect(github.listOpenPullRequestCalls).toHaveLength(0);
+    expect(github.createPullRequestCalls).toHaveLength(0);
 
     fixture.store.close();
   });
