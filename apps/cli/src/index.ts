@@ -86,13 +86,13 @@ interface ProjectSummary {
 
 interface ActiveRunItem {
   seq: number;
-  runId: string;
+  runId: string | null;
   loopId: string;
   projectId: string;
   type: string;
   status: string;
   currentStep: string | null;
-  startedAt: string;
+  startedAt: string | null;
   target:
     | {
         type: "project";
@@ -1068,7 +1068,7 @@ async function runPs(context: CliContext) {
   }
 
   if (data.items.length === 0) {
-    context.write("No running loops.");
+    context.write("No running or queued loops.");
     return;
   }
 
@@ -1217,7 +1217,11 @@ async function runStop(context: CliContext) {
   }
 }
 
-function formatRelativeAge(startedAt: string): string {
+function formatRelativeAge(startedAt: string | null): string {
+  if (!startedAt) {
+    return "-";
+  }
+
   const started = Date.parse(startedAt);
   if (Number.isNaN(started)) {
     return "-";

@@ -11,6 +11,7 @@ import { createLooperdApi } from "./index";
 async function createFixture(options?: {
   runtimeControl?: {
     stopLoop(input: { loopId: string; reason: string }): Promise<unknown>;
+    triggerSchedulerTick(): void;
   };
 }) {
   const rootDir = await mkdtemp(join(tmpdir(), "looperd-api-"));
@@ -157,6 +158,7 @@ async function createFixture(options?: {
             vendor?: string;
             pid?: number | null;
           }>;
+          triggerSchedulerTick(): void;
         }
       | undefined,
   });
@@ -393,7 +395,15 @@ describe("createLooperdApi", () => {
   });
 
   test("supports loop and worker mutation routes", async () => {
-    const { api, store, rootDir } = await createFixture();
+    let schedulerTriggerCalls = 0;
+    const { api, store, rootDir } = await createFixture({
+      runtimeControl: {
+        stopLoop: async () => ({ stopped: false }),
+        triggerSchedulerTick: () => {
+          schedulerTriggerCalls += 1;
+        },
+      },
+    });
 
     const pauseLoopResponse = await api.handle(
       new Request("http://localhost/api/v1/loops/loop_1/pause", {
@@ -439,7 +449,7 @@ describe("createLooperdApi", () => {
       };
     };
     expect(createWorkerResponse.status).toBe(200);
-    expect(createWorkerBody.data.status).toBe("running");
+    expect(createWorkerBody.data.status).toBe("queued");
     expect(createWorkerBody.data.title).toBe("Implement CLI route");
     expect(createWorkerBody.data.specPath).toBe("specs/cli.md");
     expect(
@@ -449,6 +459,7 @@ describe("createLooperdApi", () => {
       type: "worker",
       status: "queued",
     });
+    expect(schedulerTriggerCalls).toBe(1);
 
     const createSecondProjectWorkerResponse = await api.handle(
       new Request("http://localhost/api/v1/workers", {
@@ -472,7 +483,7 @@ describe("createLooperdApi", () => {
         };
       };
     expect(createSecondProjectWorkerResponse.status).toBe(200);
-    expect(createSecondProjectWorkerBody.data.status).toBe("running");
+    expect(createSecondProjectWorkerBody.data.status).toBe("queued");
     expect(createSecondProjectWorkerBody.data.title).toBe(
       "Add CLI list command",
     );
@@ -512,7 +523,7 @@ describe("createLooperdApi", () => {
         };
       };
     expect(createWorkerFromPrResponse.status).toBe(200);
-    expect(createWorkerFromPrBody.data.status).toBe("running");
+    expect(createWorkerFromPrBody.data.status).toBe("queued");
     expect(createWorkerFromPrBody.data.repo).toBe("acme/looper");
     expect(createWorkerFromPrBody.data.prNumber).toBe(42);
     expect(
@@ -666,7 +677,7 @@ describe("createLooperdApi", () => {
         };
       };
     expect(createWorkerFromIssueResponse.status).toBe(200);
-    expect(createWorkerFromIssueBody.data.status).toBe("running");
+    expect(createWorkerFromIssueBody.data.status).toBe("queued");
     expect(createWorkerFromIssueBody.data.issueNumber).toBe(125);
     expect(createWorkerFromIssueBody.data.prNumber).toBe(77);
     expect(createWorkerFromIssueBody.data.specPath).toBe("specs/issue-125.md");
@@ -725,7 +736,7 @@ describe("createLooperdApi", () => {
       };
     };
     expect(missingIssueResponse.status).toBe(200);
-    expect(missingIssueBody.data.status).toBe("running");
+    expect(missingIssueBody.data.status).toBe("queued");
     expect(missingIssueBody.data.issueNumber).toBe(999);
     expect(missingIssueBody.data.prNumber).toBeNull();
     expect(missingIssueBody.data.specPath).toBeNull();
@@ -1176,6 +1187,24 @@ describe("createLooperdApi", () => {
       updatedAt: "2026-04-11T12:03:30.000Z",
     });
 
+    store.loops.upsert({
+      id: "loop_worker_queued",
+      seq: 9,
+      projectId: "project_1",
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      repo: null,
+      prNumber: null,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: "2026-04-11T12:04:00.000Z",
+      createdAt: "2026-04-11T12:04:00.000Z",
+      updatedAt: "2026-04-11T12:04:00.000Z",
+    });
+
     // null-runId active execution is ignored
     store.agentExecutions.upsert({
       id: "agent_exec_null_run",
@@ -1278,9 +1307,10 @@ describe("createLooperdApi", () => {
     const body = (await response.json()) as {
       data: {
         items: Array<{
-          runId: string;
+          runId: string | null;
           type: string;
           currentStep: string | null;
+          status: string;
           target: {
             type: string;
             label: string;
@@ -1303,6 +1333,7 @@ describe("createLooperdApi", () => {
       "run_1",
       "run_planner_1",
       "run_worker_fallback",
+      null,
     ]);
 
     const reviewer = body.data.items.find((item) => item.runId === "run_1");
@@ -1372,24 +1403,38 @@ describe("createLooperdApi", () => {
       label: "project_fallback",
     });
 
+    const queuedWorker = body.data.items.find((item) => item.runId === null);
+    expect(queuedWorker).toMatchObject({
+      type: "worker",
+      status: "queued",
+      currentStep: null,
+      target: {
+        type: "project",
+        projectId: "project_1",
+        label: "Looper",
+      },
+      agent: null,
+    });
+
     const typeFiltered = await api.handle(
       new Request("http://localhost/api/v1/runs/active?type=worker"),
     );
     const typeFilteredBody = (await typeFiltered.json()) as {
-      data: { items: Array<{ runId: string }> };
+      data: { items: Array<{ runId: string | null }> };
     };
     expect(typeFilteredBody.data.items.map((item) => item.runId)).toEqual([
       "run_worker_1",
       "run_worker_fallback",
+      null,
     ]);
 
     const projectFiltered = await api.handle(
       new Request("http://localhost/api/v1/runs/active?projectId=project_1"),
     );
     const projectFilteredBody = (await projectFiltered.json()) as {
-      data: { items: Array<{ runId: string }> };
+      data: { items: Array<{ runId: string | null }> };
     };
-    expect(projectFilteredBody.data.items).toHaveLength(5);
+    expect(projectFilteredBody.data.items).toHaveLength(6);
 
     const prFiltered = await api.handle(
       new Request(
@@ -1555,6 +1600,7 @@ describe("createLooperdApi", () => {
             stopped: true,
           };
         },
+        triggerSchedulerTick: () => {},
       },
     });
 
