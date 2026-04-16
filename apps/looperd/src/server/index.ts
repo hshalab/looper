@@ -15,6 +15,16 @@ import {
   definePullRequestLoopTarget,
 } from "../domain/index";
 import {
+  LOOPERD_BINARY_BASENAME,
+  LOOPERD_BUILD_METADATA,
+  LOOPERD_INSTALL_DIR,
+  LOOPERD_SUPPORTED_TARGETS,
+  LOOPERD_VERSION,
+  getCurrentLooperdTarget,
+  getLooperdArtifactName,
+  isLooperdSupportedTarget,
+} from "../metadata";
+import {
   ProjectIdCollisionError,
   type ProjectManager,
 } from "../projects/index";
@@ -293,14 +303,25 @@ function buildStatusResponse(context: LooperdApiContext) {
   const runs = context.store.runs.list();
   const queueItems = context.store.queue.list();
   const storage = context.store.schema.healthcheck();
+  const currentTarget = getCurrentLooperdTarget();
 
   return {
     service: {
       healthy: storage.ok,
-      version: "0.1.0",
+      version: LOOPERD_VERSION,
+      build: LOOPERD_BUILD_METADATA,
       daemonMode: context.config.daemon.mode,
       startedAt: context.getStartedAt()?.toISOString(),
       recovery: context.getRecoverySummary(),
+      binary: {
+        name: LOOPERD_BINARY_BASENAME,
+        installDir: LOOPERD_INSTALL_DIR,
+        currentTarget,
+        artifactName: isLooperdSupportedTarget(currentTarget)
+          ? getLooperdArtifactName(currentTarget)
+          : null,
+        supportedTargets: [...LOOPERD_SUPPORTED_TARGETS],
+      },
     },
     storage: {
       mode: storage.mode,

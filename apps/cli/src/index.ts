@@ -1,9 +1,11 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { spawn } from "node:child_process";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir, arch as osArch, platform as osPlatform } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { cac } from "cac";
+import cliPackageJson from "../package.json";
 
 import {
   type ApiClient,
@@ -11,7 +13,18 @@ import {
   type FetchLike,
   createApiClient,
 } from "./client";
+import {
+  type DaemonInstallResult,
+  installLooperdBinary,
+} from "./daemon-install";
+import {
+  buildGitHubReleaseApiUrl,
+  resolveGitHubReleaseVersion,
+} from "./daemon-release";
 import { printJson, printSection, printTable } from "./format";
+
+const CLI_PACKAGE_NAME = cliPackageJson.name;
+const CURRENT_CLI_VERSION = cliPackageJson.version;
 
 type Writer = (line: string) => void;
 
@@ -32,6 +45,32 @@ interface CliDeps {
     cwd: string;
     env: Record<string, string | undefined>;
   }) => Promise<number>;
+  runCommandImpl?: (options: {
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string | undefined>;
+    timeoutMs?: number;
+  }) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  daemonInstallImpl?: (options: {
+    fetchImpl: FetchLike;
+    platform: NodeJS.Platform;
+    arch: string;
+    homeDir: string;
+    force: boolean;
+    tag?: string;
+  }) => Promise<DaemonInstallResult>;
+  writeFileImpl?: (path: string, contents: string) => Promise<void>;
+  mkdirImpl?: (path: string, options: { recursive: boolean }) => Promise<void>;
+  removeFileImpl?: (path: string) => Promise<void>;
+  killImpl?: (pid: number, signal?: NodeJS.Signals | number) => void;
+  spawnDetachedImpl?: (options: {
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string | undefined>;
+  }) => { pid: number | undefined };
+  sleepImpl?: (ms: number) => Promise<void>;
 }
 
 interface CliContext {
@@ -46,6 +85,30 @@ interface CliContext {
   cwd: string;
   isStdoutTty: boolean;
   launchShell: (cwd: string) => Promise<number>;
+  runCommand: (options: {
+    command: string;
+    args: string[];
+    timeoutMs?: number;
+  }) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  fetchImpl: FetchLike;
+  installDaemon: (options: {
+    platform: NodeJS.Platform;
+    arch: string;
+    homeDir: string;
+    force: boolean;
+    tag?: string;
+  }) => Promise<DaemonInstallResult>;
+  writeFileImpl: (path: string, contents: string) => Promise<void>;
+  mkdirImpl: (path: string, options: { recursive: boolean }) => Promise<void>;
+  removeFileImpl: (path: string) => Promise<void>;
+  killImpl: (pid: number, signal?: NodeJS.Signals | number) => void;
+  spawnDetached: (options: {
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string | undefined>;
+  }) => { pid: number | undefined };
+  sleep: (ms: number) => Promise<void>;
 }
 
 type CliRuntime = Omit<CliContext, "args">;
@@ -221,12 +284,13 @@ export async function runCli(
       env,
       cwd,
     });
+    const fetchImpl = deps.fetchImpl ?? fetch;
     const client = createApiClient({
       baseUrl:
         config.config.server.baseUrl ??
         `http://${config.config.server.host}:${config.config.server.port}`,
       token: env.LOOPER_TOKEN ?? config.config.server.localToken,
-      fetchImpl: deps.fetchImpl,
+      fetchImpl,
     });
     const runtime: CliRuntime = {
       write,
@@ -243,13 +307,48 @@ export async function runCli(
           cwd: shellCwd,
           env,
         }),
+      runCommand: async ({ command, args, timeoutMs }) =>
+        (deps.runCommandImpl ?? runCommand)({
+          command,
+          args,
+          cwd,
+          env,
+          timeoutMs,
+        }),
+      fetchImpl,
+      installDaemon: async ({ platform, arch, homeDir, force, tag }) =>
+        (deps.daemonInstallImpl ?? installLooperdBinary)({
+          fetchImpl,
+          platform,
+          arch,
+          homeDir,
+          force,
+          tag,
+        }),
+      writeFileImpl: async (path, contents) =>
+        (deps.writeFileImpl ?? writeFile)(path, contents),
+      mkdirImpl: async (path, options) => {
+        if (deps.mkdirImpl) {
+          await deps.mkdirImpl(path, options);
+          return;
+        }
+        await mkdir(path, options);
+      },
+      removeFileImpl: async (path) =>
+        deps.removeFileImpl ? deps.removeFileImpl(path) : await rm(path),
+      killImpl: deps.killImpl ?? ((pid, signal) => process.kill(pid, signal)),
+      spawnDetached: (options) =>
+        (deps.spawnDetachedImpl ?? spawnDetachedDaemon)(options),
+      sleep:
+        deps.sleepImpl ??
+        ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     };
 
     const cli = createCli(runtime);
     runtime.showHelp = (commandName) => {
       outputCommandHelp(cli, commandName);
     };
-    cli.parse(["bun", "looper", ...argv], { run: false });
+    cli.parse(["node", "looper", ...argv], { run: false });
 
     if (!cli.matchedCommand) {
       if (argv.includes("--help") || argv.includes("-h")) {
@@ -290,14 +389,25 @@ async function dispatch(context: CliContext): Promise<void> {
       }
       return runConfigShow(context);
     case "daemon":
+      if (subcommand === "install") {
+        return runDaemonInstall(context);
+      }
       if (subcommand === "status") {
         return runDaemonStatus(context);
+      }
+      if (subcommand === "start") {
+        return runDaemonStart(context);
+      }
+      if (subcommand === "restart") {
+        return runDaemonRestart(context);
       }
       if (subcommand === "logs") {
         return runDaemonLogs(context);
       }
       context.showHelp("daemon");
       return;
+    case "upgrade":
+      return runUpgrade(context);
     case "loop":
       if (subcommand === "list") {
         return runLoopList(context);
@@ -391,10 +501,24 @@ function createCli(runtime: CliRuntime) {
     .command("daemon [...args]", "Daemon commands")
     .usage("daemon <subcommand> [options]")
     .option("--lines <count>", "Line count")
+    .option("--force", "Overwrite existing installed daemon binary")
+    .example((name) => `  $ ${name} daemon install`)
+    .example((name) => `  $ ${name} daemon start`)
+    .example((name) => `  $ ${name} daemon restart`)
     .example((name) => `  $ ${name} daemon status`)
     .example((name) => `  $ ${name} daemon logs --lines 50`)
     .action(async (args, options) => {
       await dispatch(createContext(runtime, ["daemon", ...args], options));
+    });
+
+  cli
+    .command("upgrade", "Check or upgrade Looper installations")
+    .option("--check", "Check available CLI and daemon updates")
+    .option("--daemon", "Install or upgrade the managed daemon binary")
+    .example((name) => `  $ ${name} upgrade --check`)
+    .example((name) => `  $ ${name} upgrade --daemon`)
+    .action(async (options) => {
+      await dispatch(createContext(runtime, ["upgrade"], options));
     });
 
   cli
@@ -766,24 +890,46 @@ async function runProjectAdd(context: CliContext) {
 }
 
 async function runDaemonStatus(context: CliContext) {
-  let health: unknown = null;
+  let status: Record<string, unknown> | null = null;
+  let health: Record<string, unknown> | null = null;
   let reachable = false;
 
   try {
-    health =
-      await context.client.get<Record<string, unknown>>("/api/v1/healthz");
+    status =
+      await context.client.get<Record<string, unknown>>("/api/v1/status");
     reachable = true;
   } catch (error) {
     if (!(error instanceof CliApiError)) {
       throw error;
     }
+
+    try {
+      health =
+        await context.client.get<Record<string, unknown>>("/api/v1/healthz");
+      reachable = true;
+    } catch (healthError) {
+      if (!(healthError instanceof CliApiError)) {
+        throw healthError;
+      }
+    }
   }
+
+  const runningVersion = (status?.service as { version?: string } | undefined)
+    ?.version;
+  const daemonVersion = runningVersion
+    ? { version: runningVersion, source: "api" as const, binaryPath: null }
+    : ((await readManagedDaemonVersion(context)) ??
+      (await readPathDaemonVersion(context)));
 
   const data = {
     mode: context.config.config.daemon.mode,
     configPath: context.config.metadata.configPath,
     logDir: context.config.config.daemon.logDir,
     apiReachable: reachable,
+    daemonVersion: daemonVersion?.version ?? null,
+    daemonVersionSource: daemonVersion?.source ?? null,
+    daemonBinaryPath: daemonVersion?.binaryPath ?? null,
+    status,
     health,
   };
 
@@ -796,11 +942,701 @@ async function runDaemonStatus(context: CliContext) {
     ["configPath", data.configPath],
     ["logDir", data.logDir],
     ["apiReachable", data.apiReachable],
+    ["daemonVersion", data.daemonVersion ?? "not installed"],
+    ["daemonVersionSource", data.daemonVersionSource ?? "unavailable"],
+    ["daemonBinaryPath", data.daemonBinaryPath ?? "-"],
   ]);
   if (reachable) {
     context.write("");
-    printJson(context.write, health);
+    printJson(context.write, status ?? health);
   }
+}
+
+async function runDaemonInstall(context: CliContext) {
+  const homeDir =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+  const force = hasFlag(context.args, "force");
+
+  try {
+    const result = await context.installDaemon({
+      platform: osPlatform(),
+      arch: osArch(),
+      homeDir,
+      force,
+    });
+
+    if (hasFlag(context.args, "json")) {
+      return printJson(context.write, result);
+    }
+
+    if (result.skipped) {
+      context.write(
+        `looperd is already installed at ${result.installPath} (use --force to overwrite)`,
+      );
+      return;
+    }
+
+    context.write(
+      `Installed looperd (${result.target}) to ${result.installPath}`,
+    );
+    if (result.downloadedFrom) {
+      context.write(`Downloaded from ${result.downloadedFrom}`);
+    }
+  } catch (error) {
+    throw new Error(`Failed to install looperd: ${formatError(error)}`);
+  }
+}
+
+interface DaemonVersionState {
+  version: string;
+  source: "api" | "installed-binary" | "path-binary";
+  binaryPath: string | null;
+}
+
+interface UpgradeCheckSummary {
+  cli: {
+    currentVersion: string;
+    latestVersion: string;
+    updateAvailable: boolean;
+  };
+  daemon: {
+    currentVersion: string | null;
+    latestVersion: string;
+    updateAvailable: boolean;
+    installed: boolean;
+    source: DaemonVersionState["source"] | "not-installed";
+    binaryPath: string | null;
+  };
+}
+
+interface LatestDaemonReleaseInfo {
+  version: string;
+  tag: string;
+}
+
+async function runUpgrade(context: CliContext) {
+  const check = hasFlag(context.args, "check");
+  const daemonOnly = hasFlag(context.args, "daemon");
+
+  if (check && daemonOnly) {
+    throw new Error("--check and --daemon cannot be combined");
+  }
+
+  if (check) {
+    const summary = await collectUpgradeCheckSummary(context);
+    if (hasFlag(context.args, "json")) {
+      return printJson(context.write, summary);
+    }
+
+    return printUpgradeSummary(context, summary);
+  }
+
+  if (daemonOnly) {
+    return runDaemonUpgrade(context);
+  }
+
+  throw new Error(
+    "Full `looper upgrade` (CLI + daemon) is not implemented yet. Use `looper upgrade --check` or `looper upgrade --daemon`.",
+  );
+}
+
+async function runDaemonUpgrade(context: CliContext) {
+  const [current, managedDaemon, pathDaemon, latestRelease] = await Promise.all(
+    [
+      detectDaemonVersionState(context),
+      readManagedDaemonVersion(context),
+      readPathDaemonVersion(context),
+      fetchLatestDaemonRelease(context),
+    ],
+  );
+  const homeDir =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+
+  const currentVersion = managedDaemon?.version ?? current?.version ?? null;
+  const needsInstall = managedDaemon === null;
+  const needsUpgrade =
+    needsInstall ||
+    currentVersion === null ||
+    normalizeVersion(currentVersion) !==
+      normalizeVersion(latestRelease.version);
+
+  if (!needsUpgrade) {
+    const payload = {
+      changed: false,
+      currentVersion,
+      latestVersion: latestRelease.version,
+      binaryPath: managedDaemon?.binaryPath ?? current?.binaryPath ?? null,
+    };
+    if (hasFlag(context.args, "json")) {
+      return printJson(context.write, payload);
+    }
+
+    context.write(`looperd is already up to date (${currentVersion})`);
+    if (managedDaemon?.binaryPath) {
+      context.write(`Managed binary: ${managedDaemon.binaryPath}`);
+    }
+    return;
+  }
+
+  let result: DaemonInstallResult;
+  try {
+    result = await context.installDaemon({
+      platform: osPlatform(),
+      arch: osArch(),
+      homeDir,
+      force: true,
+      tag: latestRelease.tag,
+    });
+  } catch (error) {
+    throw new Error(`Failed to upgrade looperd: ${formatError(error)}`);
+  }
+
+  const payload = {
+    changed: true,
+    previousVersion: current?.version ?? null,
+    latestVersion: latestRelease.version,
+    installPath: result.installPath,
+    downloadedFrom: result.downloadedFrom,
+    skipped: result.skipped,
+  };
+  if (hasFlag(context.args, "json")) {
+    return printJson(context.write, payload);
+  }
+
+  if (managedDaemon === null && pathDaemon !== null) {
+    context.write(
+      `Installed managed looperd ${latestRelease.version} to ${result.installPath} (previously using ${pathDaemon.binaryPath})`,
+    );
+  } else if (managedDaemon === null) {
+    context.write(
+      `Installed looperd ${latestRelease.version} to ${result.installPath}`,
+    );
+  } else {
+    context.write(
+      `Upgraded looperd ${managedDaemon.version} → ${latestRelease.version} at ${result.installPath}`,
+    );
+  }
+  if (result.downloadedFrom) {
+    context.write(`Downloaded from ${result.downloadedFrom}`);
+  }
+  context.write("Restart the daemon to use the new version:");
+  context.write("  looper daemon restart");
+}
+
+async function collectUpgradeCheckSummary(
+  context: CliContext,
+): Promise<UpgradeCheckSummary> {
+  const [latestCliVersion, latestDaemonVersion, currentDaemon] =
+    await Promise.all([
+      fetchLatestCliVersion(context),
+      fetchLatestDaemonRelease(context).then((release) => release.version),
+      detectDaemonVersionState(context),
+    ]);
+
+  return {
+    cli: {
+      currentVersion: CURRENT_CLI_VERSION,
+      latestVersion: latestCliVersion,
+      updateAvailable:
+        normalizeVersion(CURRENT_CLI_VERSION) !==
+        normalizeVersion(latestCliVersion),
+    },
+    daemon: {
+      currentVersion: currentDaemon?.version ?? null,
+      latestVersion: latestDaemonVersion,
+      updateAvailable:
+        currentDaemon === null ||
+        normalizeVersion(currentDaemon.version) !==
+          normalizeVersion(latestDaemonVersion),
+      installed: currentDaemon?.source === "installed-binary",
+      source: currentDaemon?.source ?? "not-installed",
+      binaryPath: currentDaemon?.binaryPath ?? null,
+    },
+  };
+}
+
+function printUpgradeSummary(
+  context: CliContext,
+  summary: UpgradeCheckSummary,
+): void {
+  printSection(context.write, "Upgrade check", [
+    ["cliCurrent", summary.cli.currentVersion],
+    ["cliLatest", summary.cli.latestVersion],
+    ["cliUpdateAvailable", summary.cli.updateAvailable],
+    ["daemonCurrent", summary.daemon.currentVersion ?? "not installed"],
+    ["daemonLatest", summary.daemon.latestVersion],
+    ["daemonUpdateAvailable", summary.daemon.updateAvailable],
+    ["daemonSource", summary.daemon.source],
+    ["daemonBinaryPath", summary.daemon.binaryPath ?? "-"],
+  ]);
+}
+
+async function fetchLatestCliVersion(context: CliContext): Promise<string> {
+  const packageName = encodeURIComponent(CLI_PACKAGE_NAME);
+  const response = await context.fetchImpl(
+    `https://registry.npmjs.org/${packageName}/latest`,
+    {
+      headers: {
+        accept: "application/json",
+        "user-agent": "looper-cli",
+      },
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch npm metadata for ${CLI_PACKAGE_NAME} (status ${response.status} ${response.statusText})`,
+    );
+  }
+
+  const payload = (await response.json()) as { version?: unknown };
+  if (
+    typeof payload.version !== "string" ||
+    payload.version.trim().length === 0
+  ) {
+    throw new Error(`npm metadata for ${CLI_PACKAGE_NAME} is missing version`);
+  }
+
+  return payload.version;
+}
+
+async function fetchLatestDaemonRelease(
+  context: CliContext,
+): Promise<LatestDaemonReleaseInfo> {
+  const response = await context.fetchImpl(
+    buildGitHubReleaseApiUrl({ owner: "powerformer", repo: "looper" }),
+    {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "looper-cli",
+      },
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch latest looperd release metadata (status ${response.status} ${response.statusText})`,
+    );
+  }
+
+  const payload = (await response.json()) as { tag_name?: string };
+
+  return {
+    version: resolveGitHubReleaseVersion(payload),
+    tag: payload.tag_name ?? `v${resolveGitHubReleaseVersion(payload)}`,
+  };
+}
+
+async function detectDaemonVersionState(
+  context: CliContext,
+): Promise<DaemonVersionState | null> {
+  try {
+    const status =
+      await context.client.get<Record<string, unknown>>("/api/v1/status");
+    const runningVersion = (status.service as { version?: unknown } | undefined)
+      ?.version;
+    if (
+      typeof runningVersion === "string" &&
+      runningVersion.trim().length > 0
+    ) {
+      return {
+        version: runningVersion,
+        source: "api",
+        binaryPath: null,
+      };
+    }
+  } catch (error) {
+    if (!(error instanceof CliApiError)) {
+      throw error;
+    }
+  }
+
+  const resolvedBinary = await resolveDaemonBinary(context);
+  if (!resolvedBinary) {
+    return null;
+  }
+
+  try {
+    const result = await context.runCommand({
+      command: resolvedBinary.path,
+      args: ["--version"],
+      timeoutMs: 5_000,
+    });
+    if (result.exitCode !== 0) {
+      return null;
+    }
+
+    const version = result.stdout.trim();
+    if (!version) {
+      return null;
+    }
+
+    return {
+      version,
+      source:
+        resolvedBinary.source === "installed"
+          ? "installed-binary"
+          : "path-binary",
+      binaryPath: resolvedBinary.path,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeVersion(value: string): string {
+  return value.trim().replace(/^v/, "");
+}
+
+async function readManagedDaemonVersion(
+  context: CliContext,
+): Promise<{ version: string; source: "binary"; binaryPath: string } | null> {
+  const home =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+  const binaryPath = join(home, ".looper", "bin", "looperd");
+
+  return readDaemonVersion(context, binaryPath);
+}
+
+async function readPathDaemonVersion(
+  context: CliContext,
+): Promise<{ version: string; source: "binary"; binaryPath: string } | null> {
+  return readDaemonVersion(context, "looperd");
+}
+
+async function readDaemonVersion(
+  context: CliContext,
+  command: string,
+): Promise<{ version: string; source: "binary"; binaryPath: string } | null> {
+  const result = await runVersionCommand(context, command);
+  if (result === null) {
+    return null;
+  }
+
+  return {
+    version: result,
+    source: "binary",
+    binaryPath: command,
+  };
+}
+
+async function runVersionCommand(
+  context: CliContext,
+  command: string,
+): Promise<string | null> {
+  try {
+    const result = await context.runCommand({
+      command,
+      args: ["--version"],
+      timeoutMs: 5_000,
+    });
+    if (result.exitCode !== 0) {
+      return null;
+    }
+
+    const version = result.stdout.trim();
+    return version.length > 0 ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+async function runDaemonStart(context: CliContext) {
+  const binary = await resolveDaemonBinary(context);
+  if (!binary) {
+    throw new Error(
+      "Cannot find looperd binary. Lookup order: ~/.looper/bin/looperd, then $PATH.",
+    );
+  }
+
+  const pidFilePath = resolveDaemonPidFilePath(context);
+  const existingPid = await readPidFile(context, pidFilePath);
+  if (existingPid && isProcessAlive(context, existingPid)) {
+    if (await isLooperdProcess(context, existingPid)) {
+      context.write(
+        `looperd already appears to be running (pid ${existingPid})`,
+      );
+      context.write(
+        "Phase 1 process management is minimal: use `looper daemon restart` or stop the process manually if needed.",
+      );
+      return;
+    }
+
+    await removePidFile(context, pidFilePath);
+    context.write(
+      `Daemon pid ${existingPid} does not appear to be looperd; treating pid file as stale.`,
+    );
+  } else if (existingPid) {
+    await removePidFile(context, pidFilePath);
+    context.write(`Removed stale daemon pid file for pid ${existingPid}`);
+  }
+
+  const child = context.spawnDetached({
+    command: binary.path,
+    args: buildDaemonLaunchArgs(context.args),
+    cwd: context.cwd,
+    env: context.env,
+  });
+  const pid = child.pid;
+  if (!pid || pid <= 0) {
+    throw new Error("Failed to start looperd: process did not report a pid");
+  }
+
+  await context.sleep(100);
+  if (
+    !isProcessAlive(context, pid) ||
+    !(await isLooperdProcess(context, pid))
+  ) {
+    await removePidFile(context, pidFilePath);
+    throw new Error(
+      `Failed to start looperd: process ${pid} exited during startup`,
+    );
+  }
+
+  await context.mkdirImpl(dirname(pidFilePath), { recursive: true });
+  await context.writeFileImpl(pidFilePath, `${pid}\n`);
+
+  context.write(`Started looperd (${binary.path}) with pid ${pid}`);
+  context.write(`PID file: ${pidFilePath}`);
+  context.write(
+    "Phase 1 process management is minimal and does not provide full background supervision.",
+  );
+}
+
+async function runDaemonRestart(context: CliContext) {
+  const pidFilePath = resolveDaemonPidFilePath(context);
+  const existingPid = await readPidFile(context, pidFilePath);
+
+  if (!existingPid) {
+    context.write("No daemon pid file found; starting daemon.");
+    return runDaemonStart(context);
+  }
+
+  if (!isProcessAlive(context, existingPid)) {
+    context.write(`Daemon pid ${existingPid} is stale; starting daemon.`);
+    await removePidFile(context, pidFilePath);
+    return runDaemonStart(context);
+  }
+
+  if (!(await isLooperdProcess(context, existingPid))) {
+    context.write(
+      `Daemon pid ${existingPid} does not appear to be looperd; treating pid file as stale.`,
+    );
+    await removePidFile(context, pidFilePath);
+    return runDaemonStart(context);
+  }
+
+  context.killImpl(existingPid, "SIGTERM");
+  await waitForProcessExit(context, existingPid, 2_000, 100);
+  await removePidFile(context, pidFilePath);
+  context.write(`Stopped looperd pid ${existingPid}`);
+
+  await runDaemonStart(context);
+}
+
+function spawnDetachedDaemon(options: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string | undefined>;
+}): { pid: number | undefined } {
+  const env = Object.fromEntries(
+    Object.entries(options.env).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+
+  const child = spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env,
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  return { pid: child.pid };
+}
+
+function resolveDaemonPidFilePath(context: CliContext): string {
+  const home =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+  return join(home, ".looper", "looperd.pid");
+}
+
+async function resolveDaemonBinary(
+  context: CliContext,
+): Promise<{ path: string; source: "installed" | "path" } | null> {
+  const home =
+    context.env.HOME ?? context.env.USERPROFILE ?? homedir() ?? process.cwd();
+  const candidates: Array<{ path: string; source: "installed" | "path" }> = [
+    { path: join(home, ".looper", "bin", "looperd"), source: "installed" },
+    { path: "looperd", source: "path" },
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const result = await context.runCommand({
+        command: candidate.path,
+        args: ["--version"],
+        timeoutMs: 5_000,
+      });
+      if (result.exitCode === 0) {
+        return candidate;
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+
+  return null;
+}
+
+async function readPidFile(
+  context: CliContext,
+  pidFilePath: string,
+): Promise<number | null> {
+  try {
+    const raw = await context.readFileImpl(pidFilePath, "utf8");
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) {
+      return null;
+    }
+
+    const pid = Number.parseInt(trimmed, 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function removePidFile(context: CliContext, pidFilePath: string) {
+  try {
+    await context.removeFileImpl(pidFilePath);
+  } catch {
+    // best effort for minimal process management
+  }
+}
+
+function isProcessAlive(context: CliContext, pid: number): boolean {
+  try {
+    context.killImpl(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isLooperdProcess(
+  context: CliContext,
+  pid: number,
+): Promise<boolean> {
+  const command = await readProcessCommand(context, pid);
+  if (!command) {
+    return false;
+  }
+
+  const tokens = command
+    .trim()
+    .split(/\s+/)
+    .map((token) => token.replace(/^['"]|['"]$/g, ""))
+    .filter((token) => token.length > 0);
+
+  const executable = tokens[0];
+  if (!executable) {
+    return false;
+  }
+
+  if (basename(executable) === "looperd") {
+    return true;
+  }
+
+  if (!isLooperdInterpreter(basename(executable))) {
+    return false;
+  }
+
+  const scriptToken = tokens[1];
+  return scriptToken ? basename(scriptToken) === "looperd" : false;
+}
+
+function isLooperdInterpreter(executableName: string): boolean {
+  return executableName === "node" || executableName === "bun";
+}
+
+async function readProcessCommand(
+  context: CliContext,
+  pid: number,
+): Promise<string | null> {
+  try {
+    const result = await context.runCommand({
+      command: "ps",
+      args: ["-p", String(pid), "-o", "command="],
+      timeoutMs: 5_000,
+    });
+    if (result.exitCode !== 0) {
+      return null;
+    }
+
+    const command = result.stdout.trim();
+    return command.length > 0 ? command : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForProcessExit(
+  context: CliContext,
+  pid: number,
+  timeoutMs: number,
+  intervalMs: number,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(context, pid)) {
+      return;
+    }
+    await context.sleep(intervalMs);
+  }
+
+  throw new Error(`Timed out waiting for looperd pid ${pid} to exit`);
+}
+
+async function runCommand(options: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string | undefined>;
+  timeoutMs?: number;
+}): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const env = Object.fromEntries(
+    Object.entries(options.env).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+
+  const child = spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    signal: options.timeoutMs
+      ? AbortSignal.timeout(options.timeoutMs)
+      : undefined,
+  });
+
+  const stdoutChunks: Uint8Array[] = [];
+  const stderrChunks: Uint8Array[] = [];
+
+  child.stdout.on("data", (chunk: Uint8Array) => stdoutChunks.push(chunk));
+  child.stderr.on("data", (chunk: Uint8Array) => stderrChunks.push(chunk));
+
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code ?? 1));
+  });
+
+  return {
+    stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+    stderr: Buffer.concat(stderrChunks).toString("utf8"),
+    exitCode,
+  };
 }
 
 async function runDaemonLogs(context: CliContext) {
@@ -1204,14 +2040,23 @@ async function launchInteractiveShell(options: {
   env: Record<string, string | undefined>;
 }): Promise<number> {
   const shell = options.env.SHELL || "/bin/zsh";
-  const subprocess = Bun.spawn([shell, "-i"], {
-    cwd: options.cwd,
-    env: options.env,
-    stdin: "inherit",
-    stdout: "inherit",
-    stderr: "inherit",
+  return await new Promise<number>((resolve, reject) => {
+    const subprocess = spawn(shell, ["-i"], {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: "inherit",
+    });
+
+    subprocess.once("error", reject);
+    subprocess.once("exit", (code, signal) => {
+      if (signal) {
+        reject(new Error(`Interactive shell exited from signal ${signal}`));
+        return;
+      }
+
+      resolve(code ?? 0);
+    });
   });
-  return await subprocess.exited;
 }
 
 async function runLogs(context: CliContext) {
@@ -1687,6 +2532,28 @@ function readConfigArg(argv: string[], name: string): string | undefined {
   }
 
   return undefined;
+}
+
+function buildDaemonLaunchArgs(args: ParsedArgs): string[] {
+  const launchArgs: string[] = [];
+
+  for (const flagName of CONFIG_FLAGS) {
+    const values = args.flags.get(flagName);
+    if (!values) {
+      continue;
+    }
+
+    for (const value of values) {
+      if (value === "true") {
+        launchArgs.push(`--${flagName}`);
+        continue;
+      }
+
+      launchArgs.push(`--${flagName}`, value);
+    }
+  }
+
+  return launchArgs;
 }
 
 async function readJsonFile(path: string): Promise<Record<string, unknown>> {

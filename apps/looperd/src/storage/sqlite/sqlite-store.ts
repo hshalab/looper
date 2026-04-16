@@ -13,10 +13,12 @@ import type {
   WorktreeRecord,
 } from "../types";
 import { SqliteDbCoordinator } from "./db";
+import type { EmbeddedSqliteMigration } from "./migrations.gen";
 
 export interface SqliteStoreOptions {
   dbPath: string;
   backupDir?: string;
+  migrations?: EmbeddedSqliteMigration[];
   migrationsDir?: string;
   now?: () => Date;
 }

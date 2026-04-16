@@ -1,13 +1,23 @@
 {
-  "name": "@looper/cli",
-  "private": true,
+  "name": "@powerformer/looper",
+  "version": "0.1.0",
+  "private": false,
   "type": "module",
   "bin": {
     "looper": "dist/index.js"
   },
+  "files": ["dist/index.js"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20",
+    "bun": ">=1.3.12"
+  },
   "scripts": {
     "dev": "bun run src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target bun",
+    "build": "bun run scripts/build.ts",
+    "prepublishOnly": "bun run build",
     "typecheck": "bun x tsc -p tsconfig.json --noEmit",
     "test": "bun test src"
   },
