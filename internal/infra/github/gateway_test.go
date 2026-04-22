@@ -296,26 +296,12 @@ printf '{}'
 
 func writeExecutable(t *testing.T, path, contents string) {
 	t.Helper()
-	tempFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
-	if err != nil {
-		t.Fatalf("os.CreateTemp(%s) error = %v", filepath.Dir(path), err)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(contents), 0o755); err != nil {
+		t.Fatalf("os.WriteFile(%s) error = %v", tmpPath, err)
 	}
-	tempPath := tempFile.Name()
-	defer func() {
-		_ = os.Remove(tempPath)
-	}()
-	if _, err := tempFile.WriteString(contents); err != nil {
-		_ = tempFile.Close()
-		t.Fatalf("tempFile.WriteString(%s) error = %v", tempPath, err)
-	}
-	if err := tempFile.Close(); err != nil {
-		t.Fatalf("tempFile.Close(%s) error = %v", tempPath, err)
-	}
-	if err := os.Chmod(tempPath, 0o755); err != nil {
-		t.Fatalf("os.Chmod(%s) error = %v", tempPath, err)
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		t.Fatalf("os.Rename(%s, %s) error = %v", tempPath, path, err)
+	if err := os.Rename(tmpPath, path); err != nil {
+		t.Fatalf("os.Rename(%s, %s) error = %v", tmpPath, path, err)
 	}
 }
 
