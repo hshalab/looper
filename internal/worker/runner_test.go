@@ -94,6 +94,197 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	}
 }
 
+func TestBuildPullRequestBodyUsesCrossRepoClosingReference(t *testing.T) {
+	t.Parallel()
+	body := buildPullRequestBody(workerInput{Repo: "acme/looper", IssueRepo: "powerformer/looper", IssueNumber: 27, IssueURL: "https://github.com/powerformer/looper/issues/27"}, &checkpointPlan{Items: []string{"Add linked issue auto-close support"}}, &checkpointExecution{Summary: "done"})
+	if !strings.Contains(body, "Issue: powerformer/looper#27") {
+		t.Fatalf("body = %q, want issue repo reference", body)
+	}
+	if !strings.Contains(body, "Closes powerformer/looper#27") {
+		t.Fatalf("body = %q, want cross-repo closing reference", body)
+	}
+	if strings.Contains(body, "Closes #27") {
+		t.Fatalf("body = %q, want fully qualified cross-repo closing reference only", body)
+	}
+}
+
+func TestBuildPullRequestBodyUsesBareClosingReferenceForSameRepo(t *testing.T) {
+	t.Parallel()
+	body := buildPullRequestBody(workerInput{Repo: "powerformer/looper", IssueRepo: "powerformer/looper", IssueNumber: 27}, nil, nil)
+	if !strings.Contains(body, "Closes #27") {
+		t.Fatalf("body = %q, want same-repo closing reference", body)
+	}
+	if strings.Contains(body, "Closes powerformer/looper#27") {
+		t.Fatalf("body = %q, want unqualified same-repo closing reference", body)
+	}
+}
+
+func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
+	t.Parallel()
+	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27}, IssueDetail{Number: 27, Title: "Issue title", URL: "https://github.com/powerformer/looper/issues/27"})
+	if work.IssueRepo != "powerformer/looper" {
+		t.Fatalf("IssueRepo = %q, want powerformer/looper", work.IssueRepo)
+	}
+	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
+		t.Fatalf("Prompt = %q, want issue repo in prompt", work.Prompt)
+	}
+	if issueRepoFromURL("https://ghe.example.com/powerformer/looper/issues/27") != "powerformer/looper" {
+		t.Fatal("issueRepoFromURL() should infer issue repo from GitHub Enterprise URLs")
+	}
+	if issueRepoFromURL("https://gitlab.com/powerformer/looper/-/issues/27") != "" {
+		t.Fatal("issueRepoFromURL() should ignore non-GitHub hosts")
+	}
+	if issueRepoFromURL("https://github.com/powerformer/looper/issues/not-a-number") != "" {
+		t.Fatal("issueRepoFromURL() should ignore invalid issue URLs")
+	}
+	if !strings.Contains(buildAgentPullRequestInstruction(work), "Closes powerformer/looper#27") {
+		t.Fatalf("instruction = %q, want cross-repo closing reference", buildAgentPullRequestInstruction(work))
+	}
+}
+
+func TestHydrateWorkerInputFromIssueUsesSourceIssueURLWhenIssueURLMissing(t *testing.T) {
+	t.Parallel()
+	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27, IssueURL: "https://github.com/powerformer/looper/issues/27"}, IssueDetail{Number: 27, Title: "Issue title"})
+	if work.IssueRepo != "powerformer/looper" {
+		t.Fatalf("IssueRepo = %q, want powerformer/looper", work.IssueRepo)
+	}
+	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
+		t.Fatalf("Prompt = %q, want issue repo inferred from source issue URL", work.Prompt)
+	}
+	if work.IssueURL != "https://github.com/powerformer/looper/issues/27" {
+		t.Fatalf("IssueURL = %q, want source issue URL preserved", work.IssueURL)
+	}
+}
+
+func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/powerformer/looper/issues/27"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"powerformer/looper","issueNumber":27,"baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"powerformer/looper","issueNumber":27,"baseBranch":"main"}}`
+	loop.MetadataJSON = &loopMetadata
+	queueItem.PayloadJSON = &payload
+
+	work, err := runner.resolveWorkerInput(context.Background(), *project, *loop, *queueItem, workerCheckpoint{})
+	if err != nil {
+		t.Fatalf("resolveWorkerInput() error = %v", err)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
+	}
+	if github.viewIssueCalls[0].Repo != "powerformer/looper" {
+		t.Fatalf("ViewIssue repo = %q, want powerformer/looper", github.viewIssueCalls[0].Repo)
+	}
+	if work.IssueRepo != "powerformer/looper" {
+		t.Fatalf("work.IssueRepo = %q, want powerformer/looper", work.IssueRepo)
+	}
+	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
+		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
+	}
+	if strings.Contains(work.Prompt, "Implement GitHub issue acme/looper#27") {
+		t.Fatalf("Prompt = %q, want prompt to avoid worker repo issue reference", work.Prompt)
+	}
+}
+
+func TestResolveWorkerInputFallsBackToWorkerRepoForIssueHydration(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/powerformer/looper/issues/27"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main"}}`
+	loop.MetadataJSON = &loopMetadata
+	queueItem.PayloadJSON = &payload
+
+	work, err := runner.resolveWorkerInput(context.Background(), *project, *loop, *queueItem, workerCheckpoint{})
+	if err != nil {
+		t.Fatalf("resolveWorkerInput() error = %v", err)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
+	}
+	if github.viewIssueCalls[0].Repo != "acme/looper" {
+		t.Fatalf("ViewIssue repo = %q, want worker repo fallback for hydration lookup", github.viewIssueCalls[0].Repo)
+	}
+	if work.IssueRepo != "powerformer/looper" {
+		t.Fatalf("work.IssueRepo = %q, want powerformer/looper", work.IssueRepo)
+	}
+	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
+		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
+	}
+}
+
+func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/powerformer/looper/issues/27","baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/powerformer/looper/issues/27","baseBranch":"main"}}`
+	loop.MetadataJSON = &loopMetadata
+	queueItem.PayloadJSON = &payload
+
+	work, err := runner.resolveWorkerInput(context.Background(), *project, *loop, *queueItem, workerCheckpoint{})
+	if err != nil {
+		t.Fatalf("resolveWorkerInput() error = %v", err)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
+	}
+	if github.viewIssueCalls[0].Repo != "powerformer/looper" {
+		t.Fatalf("ViewIssue repo = %q, want powerformer/looper inferred from issue URL", github.viewIssueCalls[0].Repo)
+	}
+	if work.IssueRepo != "powerformer/looper" {
+		t.Fatalf("work.IssueRepo = %q, want powerformer/looper", work.IssueRepo)
+	}
+	if !strings.Contains(work.Prompt, "Implement GitHub issue powerformer/looper#27") {
+		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
+	}
+	if strings.Contains(work.Prompt, "Implement GitHub issue acme/looper#27") {
+		t.Fatalf("Prompt = %q, want prompt to avoid worker repo issue reference", work.Prompt)
+	}
+}
+
 func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -520,6 +711,7 @@ type fakeGitHubGateway struct {
 	openPRIndex     int
 	prDetail        PullRequestDetail
 	issueDetail     IssueDetail
+	viewIssueCalls  []ViewIssueInput
 	createPRResult  CreatePullRequestResult
 	createPRErrors  []error
 	createPRCalls   []CreatePullRequestInput
@@ -558,6 +750,7 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 }
 
 func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (IssueDetail, error) {
+	f.viewIssueCalls = append(f.viewIssueCalls, input)
 	detail := f.issueDetail
 	if detail.Number == 0 {
 		detail.Number = input.IssueNumber
