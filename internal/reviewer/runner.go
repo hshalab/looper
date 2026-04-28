@@ -334,6 +334,7 @@ type checkpointDetail struct {
 	HeadRefName    string   `json:"headRefName,omitempty"`
 	BaseRefName    string   `json:"baseRefName,omitempty"`
 	Author         string   `json:"author,omitempty"`
+	ReviewRequests []string `json:"reviewRequests,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -458,7 +459,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	currentLogin, _ := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	currentLogin = normalizeLogin(currentLogin)
 	result := DiscoveryResult{}
 	seen := map[string]struct{}{}
@@ -500,7 +504,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return enqueue(pr, nil)
 	}
 	for _, pr := range openPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" || currentLogin == "" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+		if pr.IsDraft || normalizePRState(pr.State) != "open" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -509,7 +513,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	for _, pr := range specPRs {
-		if pr.IsDraft || normalizePRState(pr.State) != "open" {
+		if pr.IsDraft || normalizePRState(pr.State) != "open" || !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -529,7 +533,6 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if _, ok := seen[key]; ok {
 			continue
 		}
-		seen[key] = struct{}{}
 		detail, viewErr := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath})
 		if viewErr != nil {
 			result.Skipped++
@@ -539,6 +542,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
+		if !isManualReviewerLoop(loop) && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+			result.Skipped++
+			continue
+		}
+		seen[key] = struct{}{}
 		if err := enqueue(summaryFromDetail(detail), &loop); err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -783,7 +791,7 @@ func (r *Runner) executeStep(ctx context.Context, step ReviewerStep, input stepI
 	case stepDiscover:
 		return r.runDiscoverStep(ctx, input)
 	case stepFilter:
-		return r.runFilterStep(input)
+		return r.runFilterStep(ctx, input)
 	case stepClaim:
 		return r.runClaimStep(ctx, input)
 	case stepSnapshot:
@@ -805,12 +813,12 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author}
+	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests)}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
 }
 
-func (r *Runner) runFilterStep(input stepInput) (reviewerCheckpoint, error) {
+func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for filter step", kind: FailureRetryableTransient}
@@ -822,6 +830,16 @@ func (r *Runner) runFilterStep(input stepInput) (reviewerCheckpoint, error) {
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped non-open pull request %s#%d", input.Repo, input.PRNumber)
 		return checkpoint, nil
+	}
+	if !isManualReviewerLoop(input.Loop) {
+		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
+		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, normalizeLogin(currentLogin)) {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
+			return checkpoint, nil
+		}
 	}
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
@@ -1021,6 +1039,24 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	phase := resolvePullRequestPhase(detail.Labels)
 	checkpointPhase := resolvePullRequestPhase(detailLabels(input.Checkpoint.Detail))
+	if !isManualReviewerLoop(input.Loop) {
+		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+			if pending.PublishState.ReviewSubmitted {
+				if err := r.transitionSpecReviewLabels(ctx, input, detail, phase, checkpointPhase, reviewEvent); err != nil {
+					return checkpoint, err
+				}
+				if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent); err != nil {
+					return checkpoint, err
+				}
+			}
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
+			return checkpoint, nil
+		}
+	}
 	if detail.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 		return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
 	}
@@ -1085,34 +1121,49 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		_ = r.tryRemoveReaction(ctx, input, "+1")
 	}
 	_ = r.tryRemoveReaction(ctx, input, "eyes")
-	postSubmitDetail := detail
-	if reviewEvent == ReviewEventApprove && (phase == "spec" || checkpointPhase == "spec") {
-		postSubmitDetail, err = r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: input.Project.RepoPath})
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	if err := r.transitionSpecReviewLabels(ctx, input, detail, phase, checkpointPhase, reviewEvent); err != nil {
+		return checkpoint, err
+	}
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent); err != nil {
+		return checkpoint, err
+	}
+	return checkpoint, nil
+}
+
+func (r *Runner) transitionSpecReviewLabels(ctx context.Context, input stepInput, detail PullRequestDetail, phase string, checkpointPhase string, reviewEvent ReviewEvent) error {
+	if reviewEvent != ReviewEventApprove || (phase != "spec" && checkpointPhase != "spec") {
+		return nil
+	}
+	postSubmitDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if !isSpecReviewClean(postSubmitDetail) {
+		return nil
+	}
+	if specpr.HasLabel(postSubmitDetail.Labels, specpr.ReviewingLabel) {
+		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+			return err
 		}
 	}
-	if reviewEvent == ReviewEventApprove && (phase == "spec" || checkpointPhase == "spec") && isSpecReviewClean(postSubmitDetail) {
-		if specpr.HasLabel(postSubmitDetail.Labels, specpr.ReviewingLabel) {
-			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, err
-			}
-		}
-		if !specpr.HasLabel(postSubmitDetail.Labels, specpr.ReadyLabel) {
-			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, err
-			}
+	if !specpr.HasLabel(postSubmitDetail.Labels, specpr.ReadyLabel) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
 	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
 	if err != nil {
-		return checkpoint, err
+		return err
 	}
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
-		return checkpoint, err
+		return err
 	}
-	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", repo, prNumber), payload: map[string]any{"repo": repo, "prNumber": prNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
-	return checkpoint, nil
+	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
+	return nil
 }
 
 type eventInput struct {
@@ -1159,6 +1210,10 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 				startStep = next
 			}
 		}
+	}
+	if startStep != stepDiscover && !isManualReviewerLoop(loop) && needsReviewerEligibilityRediscovery(checkpoint, startStep) {
+		startStep = stepDiscover
+		restartFromDiscover = true
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepDiscover
 	initialCheckpoint := reviewerCheckpoint{ResumePolicy: "replay_step"}
@@ -1334,6 +1389,19 @@ func (r *Runner) listFollowUpLoops(ctx context.Context, projectID, repo string) 
 		}
 	}
 	return result, nil
+}
+
+func isManualReviewerLoop(loop storage.LoopRecord) bool {
+	meta := parseJSONObject(loop.MetadataJSON)
+	manual, _ := meta["manual"].(bool)
+	return manual
+}
+
+func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint, startStep ReviewerStep) bool {
+	if checkpoint.PendingReview != nil && (startStep == stepReview || startStep == stepPublish) {
+		return false
+	}
+	return checkpoint.Detail == nil || checkpoint.Detail.ReviewRequests == nil
 }
 
 type enqueueInput struct {
@@ -1541,6 +1609,10 @@ func normalizeLogin(login string) string {
 }
 
 func isCurrentUserRequested(requested []string, currentLogin string) bool {
+	currentLogin = normalizeLogin(currentLogin)
+	if currentLogin == "" {
+		return false
+	}
 	for _, login := range requested {
 		if normalizeLogin(login) == currentLogin {
 			return true
