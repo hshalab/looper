@@ -88,7 +88,8 @@
         "allowAutoMerge": false,
         "allowRiskyFixes": false,
         "fixAllPullRequests": false,
-        "openPrStrategy": "all_done"
+        "openPrStrategy": "all_done",
+        "addSnapshotMode": "full"
       },
       "projects": []
     },
