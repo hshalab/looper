@@ -69,6 +69,10 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeReviewerConfig(&config.Reviewer, *partial.Reviewer)
 	}
 
+	if partial.Instructions != nil {
+		mergeInstructionsConfig(&config.Instructions, *partial.Instructions)
+	}
+
 	if partial.Roles != nil {
 		mergeRoleConfigs(&config.Roles, *partial.Roles)
 	}
@@ -371,6 +375,15 @@ func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewer
 	}
 }
 
+func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstructionsConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.MaxBytes != nil {
+		config.MaxBytes = *partial.MaxBytes
+	}
+}
+
 func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Planner != nil {
 		mergePlannerRoleConfig(&config.Planner, *partial.Planner)
@@ -393,6 +406,9 @@ func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRol
 	if partial.Triggers != nil {
 		mergeIssueRoleTriggersConfig(&config.Triggers, *partial.Triggers)
 	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
 }
 
 func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleConfig) {
@@ -401,6 +417,9 @@ func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleCo
 	}
 	if partial.Triggers != nil {
 		mergeIssueRoleTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
 	}
 }
 
@@ -414,6 +433,9 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	if partial.SpecReview != nil {
 		mergeReviewerSpecReviewConfig(&config.SpecReview, *partial.SpecReview)
 	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
+	}
 }
 
 func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfig) {
@@ -422,6 +444,9 @@ func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfi
 	}
 	if partial.Triggers != nil {
 		mergeFixerRoleTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.Instructions != nil {
+		config.Instructions = *partial.Instructions
 	}
 }
 
@@ -569,9 +594,11 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	cloned := make([]ProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = ProjectRefConfig{
-			ID:       project.ID,
-			Name:     project.Name,
-			RepoPath: project.RepoPath,
+			ID:           project.ID,
+			Name:         project.Name,
+			RepoPath:     firstNonEmpty(project.RepoPath, project.Path),
+			Path:         project.Path,
+			Instructions: cloneStringMap(project.Instructions),
 		}
 
 		if project.BaseBranch != nil {
@@ -584,4 +611,24 @@ func cloneProjects(projects []ProjectRefConfig) []ProjectRefConfig {
 	}
 
 	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

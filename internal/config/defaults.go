@@ -132,6 +132,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			PublishMode:             ReviewerPublishModeSingleReview,
 			DetectDuplicateFindings: true,
 		},
+		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,
