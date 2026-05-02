@@ -397,6 +397,7 @@ type pendingReviewCheckpoint struct {
 	Event                    ReviewEvent `json:"event,omitempty"`
 	Summary                  string      `json:"summary,omitempty"`
 	ContentFingerprint       string      `json:"contentFingerprint,omitempty"`
+	CleanNoop                bool        `json:"cleanNoop,omitempty"`
 	MarkerVerificationMisses int         `json:"markerVerificationMisses,omitempty"`
 }
 
@@ -441,7 +442,7 @@ func New(options Options) *Runner {
 	}
 	loopConfig := options.LoopConfig
 	if loopConfig.MaxIterationsPerPR == 0 {
-		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
+		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 900, MinPublishIntervalSeconds: 1800, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
 	}
 	scope := options.Scope
 	if scope == "" {
@@ -544,10 +545,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			return nil
 		}
-		availableAt := r.now()
-		if _, reviewed := stringFromAny(meta["lastPublishedHeadSha"]); reviewed && r.loopConfig.QuietPeriodSeconds > 0 {
-			availableAt = availableAt.Add(time.Duration(r.loopConfig.QuietPeriodSeconds) * time.Second)
-		}
+		availableAt := r.nextReviewAvailableAt(meta)
 		queueItem, queueErr := r.enqueue(ctx, enqueueInput{
 			ProjectID:   project.ID,
 			LoopID:      loopResult.record.ID,
@@ -1276,6 +1274,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
+	if cleanReviewNoopSummary(result.Summary) {
+		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, CleanNoop: true}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
+	}
 	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
@@ -1293,6 +1296,32 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-published review for head %s", pending.HeadSHA)
+		return checkpoint, nil
+	}
+	if pending.CleanNoop {
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
+			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
+		}
+		if !isManualReviewerLoop(input.Loop) && r.discoveryPolicy.RequireReviewRequest {
+			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
+				return checkpoint, nil
+			}
+		}
+		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
+			return checkpoint, err
+		}
+		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	repo := input.Repo
@@ -1372,31 +1401,10 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
-		specReviewingLabel := r.specReviewingLabel()
-		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specReviewingLabel)
-		reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
-		if reviewEvents.Clean == config.ReviewerReviewEventApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specReviewingLabel)) {
-			freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
-			if err != nil {
-				return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
-			}
-			if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
-				return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
-			}
-			detail = freshDetail
-			if !specpr.IsReviewClean(detail.ReviewDecision, detail.Comments) {
-				return nil
-			}
-			if specpr.HasLabel(detail.Labels, specReviewingLabel) {
-				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
-					return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
-				}
-			}
-			if !specpr.HasLabel(detail.Labels, specpr.ReadyLabel) {
-				if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
-					return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
-				}
-			}
+		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, marker.Event, outcome)
+		if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels); err != nil {
+			return err
 		}
 	case "actionable", "non_blocking", "blocking":
 		if err := r.github.RemovePullRequestReaction(ctx, reaction); err != nil {
@@ -1406,6 +1414,67 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		return &loopError{message: "Verified review marker is missing outcome=clean|non_blocking|blocking|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
 	}
 	return nil
+}
+
+func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail) error {
+	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
+	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
+		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+	}
+	policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, cleanReviewEventForPolicy(policy), "clean")
+	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels)
+}
+
+func cleanSpecLabelTransitionAllowed(policy config.ReviewerReviewEventsConfig, event ReviewEvent, outcome string) bool {
+	return strings.EqualFold(strings.TrimSpace(outcome), "clean") && policy.Clean == config.ReviewerReviewEventApprove && event == ReviewEventApprove
+}
+
+func cleanReviewEventForPolicy(policy config.ReviewerReviewEventsConfig) ReviewEvent {
+	if policy.Clean == config.ReviewerReviewEventApprove {
+		return ReviewEventApprove
+	}
+	return ReviewEventComment
+}
+
+func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	specReviewingLabel := r.specReviewingLabel()
+	checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specReviewingLabel)
+	if !checkpointHadSpecReviewing && !specpr.HasLabel(detail.Labels, specReviewingLabel) {
+		return nil
+	}
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
+		return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
+	}
+	if !specpr.IsReviewClean(freshDetail.ReviewDecision, freshDetail.Comments) {
+		return nil
+	}
+	if specpr.HasLabel(freshDetail.Labels, specReviewingLabel) {
+		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+			return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		}
+	}
+	if !specpr.HasLabel(freshDetail.Labels, specpr.ReadyLabel) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+			return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		}
+	}
+	return nil
+}
+
+func cleanReviewNoopSummary(summary string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(summary))
+	if normalized == "" {
+		return false
+	}
+	return strings.HasPrefix(normalized, "no actionable findings")
 }
 
 func (r *Runner) specReviewingLabel() string {
@@ -2030,6 +2099,24 @@ func (r *Runner) loopEnabled(meta map[string]any) bool {
 	return false
 }
 
+func (r *Runner) nextReviewAvailableAt(meta map[string]any) time.Time {
+	availableAt := r.now()
+	if _, reviewed := stringFromAny(meta["lastPublishedHeadSha"]); reviewed && r.loopConfig.QuietPeriodSeconds > 0 {
+		availableAt = availableAt.Add(time.Duration(r.loopConfig.QuietPeriodSeconds) * time.Second)
+	}
+	if r.loopConfig.MinPublishIntervalSeconds > 0 {
+		if lastPublishedAt, ok := stringFromAny(meta["lastPublishedAt"]); ok {
+			if parsed, err := time.Parse(time.RFC3339Nano, lastPublishedAt); err == nil {
+				minimum := parsed.Add(time.Duration(r.loopConfig.MinPublishIntervalSeconds) * time.Second)
+				if minimum.After(availableAt) {
+					availableAt = minimum
+				}
+			}
+		}
+	}
+	return availableAt
+}
+
 func loopEnabledMetadataMissing(meta map[string]any) bool {
 	if _, ok := meta["followUpdates"].(bool); ok {
 		return false
@@ -2068,6 +2155,7 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 	loopMeta["prNumber"] = prNumber
 	loopMeta["scope"] = string(r.scope)
 	loopMeta["quietPeriodSeconds"] = r.loopConfig.QuietPeriodSeconds
+	loopMeta["minPublishIntervalSeconds"] = r.loopConfig.MinPublishIntervalSeconds
 	loopMeta["maxIterationsPerPR"] = r.loopConfig.MaxIterationsPerPR
 	loopMeta["maxIterationsPerHead"] = r.loopConfig.MaxIterationsPerHead
 	loopMeta["maxWallClockSeconds"] = r.loopConfig.MaxWallClockSeconds
@@ -2245,6 +2333,9 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 
 func loopSuccessOutputFingerprint(checkpoint reviewerCheckpoint, summary string) string {
 	if checkpoint.PendingReview != nil {
+		if checkpoint.PendingReview.CleanNoop {
+			return ""
+		}
 		if fp := strings.TrimSpace(checkpoint.PendingReview.ContentFingerprint); fp != "" {
 			return fp
 		}
@@ -2409,11 +2500,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	publishInstruction := "You must publish the GitHub review yourself by calling looper's enforced review-submit wrapper from the shell. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you after the agent exits."
+	publishInstruction := "For actionable findings, you must publish the GitHub review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, do not publish a GitHub review or PR comment; use the non-comment clean signal instructions instead. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you after the agent exits."
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so do not publish a GitHub review yourself; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking.", "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not create a noisy PR review/comment; add only a +1 reaction/check-style signal as instructed and finish with a completion summary that starts with `No actionable findings`.", "Run ID for logging only, not for idempotency: " + runID}
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
@@ -2444,23 +2535,17 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)
 	}
-	approveInstruction := "Submit clean reviews as COMMENT."
+	cleanNoopInstruction := "For no-actionable-finding results, do not submit a clean COMMENT or APPROVE review; add only the non-comment clean signal and finish successfully."
 	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
-	specLabelInstruction := "Do not transition spec-review labels when clean reviews are submitted as COMMENT."
+	specLabelInstruction := "Do not transition spec-review labels for reaction-only no-actionable-finding results."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
-	reviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove {
-		approveInstruction = "If the review is clean, submit an APPROVE review."
-		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the APPROVE review is posted. Do not change labels for COMMENT, non-blocking, or blocking finding reviews."
-		reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for finding reviews or `%s review submit %s#%d --event APPROVE --commit-id %s %s` for clean reviews", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+		specLabelInstruction = "Do not transition spec-review labels for reaction-only no-actionable-finding results; only preserve an existing approved-review spec-ready transition when the idempotency check finds a prior matching APPROVED clean review."
 	}
 	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
 		blockingInstruction = "If the review has blocking findings, submit REQUEST_CHANGES with outcome=blocking. If findings are non-blocking, submit COMMENT with outcome=non_blocking. Never submit REQUEST_CHANGES for non-blocking findings."
-		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
-			reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for non-blocking findings, `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s %s` for blocking findings, or `%s review submit %s#%d --event APPROVE --commit-id %s %s` for clean reviews", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
-		} else {
-			reviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for clean or non-blocking reviews, or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
-		}
+		actionableReviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for non-blocking findings or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
 	}
 	existingMarkerEventInstruction := "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review. Ignore matching markers on APPROVED reviews and post a new COMMENT review instead."
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove || reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
@@ -2470,7 +2555,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
 	}
-	githubOperationContract := fmt.Sprintf("GitHub operation contract: submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", reviewSubmitCommand, repo, prNumber)
+	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
 	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
 	if looperCLIPath == "" {
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
@@ -2482,16 +2567,19 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		githubOperationContract,
 		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
 		reviewRequestInstruction,
-		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete prose yet, write a concise clean LGTM body or exit non-zero instead of posting logs.",
+		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete actionable prose yet, exit non-zero instead of posting logs; never use an LGTM or other clean body as a fallback.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|non_blocking|blocking -->`.",
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
 		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the full PR diff's anchorable locations. Use ANCHORABLE DIFF LOCATIONS as a summary of known ranges, but if that summary is truncated, the full PR diff remains authoritative. Preserve exact anchors that fit the full diff. If an otherwise useful comment is outside the full diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
 		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
 		"For non-blocking or blocking finding reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
 		specLabelInstruction,
-		approveInstruction,
+		cleanNoopInstruction,
 		blockingInstruction,
-		"Prefer 3 deeply specific comments over 10 shallow comments. If there is no concrete actionable feedback, post a clean review. Do not invent feedback.",
+		"Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not submit a PR review or PR comment; add the +1 reaction only and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback.",
+		"When follow-up findings target the same subsystem or topic as an existing unresolved thread, reply to that thread where possible instead of opening a separate top-level review round.",
+		"Repeated-pattern escalation: if 3 or more actionable findings target the same function/module/subsystem or the same failure mode, publish one architecture-level recommendation that names the systemic cause and preferred design direction instead of continuing one-off edge-case comments.",
+		"For complex linting/parsing logic, prefer recommending fixture-matrix tests over isolated one-regression tests. For CSS linting specifically, consider coverage for multiple style blocks, inline styles, comments, at-rules, cascade order, custom properties, var() fallbacks, theme scopes, and px/em/rem unit handling.",
 		"Every comment MUST include: (1) a location via inline anchor or exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
 		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback; top-level comment bodies must still name the exact file, section, symbol, or behavior they refer to.",
@@ -2507,7 +2595,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		"Good spec/docs comment example: {\"severity\":\"major\",\"category\":\"spec\",\"body\":\"Define the role trigger schema before implementation starts\",\"problem\":\"The spec introduces role-specific triggers but does not define the schema fields or validation rules.\",\"why\":\"Implementers cannot know which fields are required, how defaults behave, or how invalid trigger definitions should fail.\",\"evidence\":\"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.\",\"suggestedChange\":\"Add a schema table defining role, event, enabled, conditions, defaults, and validation errors, plus one valid and one invalid example.\",\"path\":\"docs/reviewer.md\",\"line\":42,\"side\":\"RIGHT\"}",
 		"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
 		"Spec/docs review rubric: check whether every requirement is testable, schemas are typed/defaulted/validated, config precedence is explicit, failure modes are defined, rollout/backward compatibility is covered, acceptance criteria are present, and ambiguous terms are resolved. For missing spec details, suggest exact wording, section, table, or example content.",
-		"If the review is clean, write a warm, specific LGTM review body that briefly praises what is good about this PR. Keep it concise, genuine, and varied; do not use a generic template if you can reference the actual PR content.",
+		"If the review is clean, do not write or publish an LGTM review body; avoid adding PR conversation noise for no-actionable-finding outcomes.",
 	)
 	if submitPayloadInstruction != "" {
 		parts = append(parts, submitPayloadInstruction)

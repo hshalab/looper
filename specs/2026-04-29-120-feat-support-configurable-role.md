@@ -1,6 +1,6 @@
 # Issue 120: Configurable role trigger conditions
 
-Issue: [powerformer/looper#120](https://github.com/powerformer/looper/issues/120)  
+Issue: [powerformer/looper#120](https://github.com/powerformer/looper/issues/120)
 Base branch: `main`
 
 ## Problem
