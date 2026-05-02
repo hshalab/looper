@@ -261,6 +261,7 @@ type Options struct {
 	ClaimTTL                time.Duration
 	AllowAutoPush           *bool
 	Disclosure              *config.DisclosureConfig
+	AgentRuntime            string
 	CustomInstructions      *config.Config
 	AgentModel              *string
 	RetryBaseDelay          time.Duration
@@ -288,6 +289,7 @@ type Runner struct {
 	claimTTL                time.Duration
 	allowAutoPush           bool
 	disclosure              config.DisclosureConfig
+	agentRuntime            string
 	customInstructions      config.Config
 	agentModel              string
 	retryBaseDelay          time.Duration
@@ -435,7 +437,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, customInstructions: customInstructionConfig(options.CustomInstructions), agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -867,7 +869,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, r.agentModel)
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -1503,7 +1505,7 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, config.CustomInstructionBlock) {
+func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for GitHub issue %s#%d.", issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
@@ -1537,9 +1539,9 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 	}
 	parts = append(parts, strings.Join(requirements, "\n"))
 	if allowAutoPush {
-		parts = append(parts, lifecycle.PromptInstruction("planner", worktree.Branch, worktree.BaseBranch, true, true, disclosureCfg, agentModel))
+		parts = append(parts, lifecycle.PromptInstruction("planner", worktree.Branch, worktree.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
-		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch, disclosureCfg, agentModel))
+		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch, disclosureCfg, agentRuntime, agentModel))
 	}
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 }
@@ -1553,11 +1555,11 @@ func customInstructionConfig(value *config.Config) config.Config {
 	return *value
 }
 
-func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {
+func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	return strings.Join([]string{
 		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
-		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentModel),
+		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentRuntime, agentModel),
 		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
 		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
 	}, "\n")

@@ -83,38 +83,47 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 	branch := "<branch>"
 	baseBranch := promptBaseBranch(project.BaseBranch, cfg.Defaults.BaseBranch)
 	allowRemote := cfg.Defaults.AllowAutoPush
+	agentRuntime := promptAgentRuntime(cfg)
+	agentModel := promptDerefString(cfg.Agent.Model)
 	switch role {
 	case "reviewer":
-		return previewReviewerLifecycleSafety(promptDerefString(cfg.Tools.LooperPath), cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		return previewReviewerLifecycleSafety(promptDerefString(cfg.Tools.LooperPath), cfg.Disclosure, agentRuntime, agentModel)
 	case "worker":
 		if !previewWorkerAllowsRemoteLifecycle(cfg) {
-			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, agentRuntime, agentModel)
 		}
-		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, agentRuntime, agentModel)
 	case "fixer":
 		branch = ""
 		baseBranch = ""
 		if !allowRemote {
-			return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+			return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, agentRuntime, agentModel)
 		}
-		return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + lifecycle.PromptInstruction(role, branch, baseBranch, true, false, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + lifecycle.PromptInstruction(role, branch, baseBranch, true, false, cfg.Disclosure, agentRuntime, agentModel)
 	default:
 		if !allowRemote {
-			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, agentRuntime, agentModel)
 		}
-		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, promptDerefString(cfg.Agent.Model))
+		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, agentRuntime, agentModel)
 	}
+}
+
+func promptAgentRuntime(cfg config.Config) string {
+	if cfg.Agent.Vendor == nil {
+		return ""
+	}
+	return string(*cfg.Agent.Vendor)
 }
 
 func previewWorkerAllowsRemoteLifecycle(cfg config.Config) bool {
 	return cfg.Defaults.AllowAutoPush && cfg.Defaults.OpenPRStrategy != config.OpenPRStrategyManual
 }
 
-func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.DisclosureConfig, agentModel string) string {
+func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	if strings.TrimSpace(looperCLIPath) == "" {
 		return strings.Join([]string{
 			"GitHub operation contract: a trusted Looper CLI path was not detected for reviewer runs, so agents cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`.",
-			lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentModel),
+			lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentRuntime, agentModel),
 		}, "\n")
 	}
 	return strings.Join([]string{
@@ -123,15 +132,15 @@ func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.D
 		"Before posting, confirm the PR is still open, the head SHA still matches the expected head SHA, and the current GitHub user is still requested for review unless the run is manual.",
 		"Every review body must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|actionable -->`.",
 		"For clean reviews, submit COMMENT unless reviewer policy allows APPROVE; for actionable reviews, submit COMMENT with resolvable inline comments whenever anchors can be validated.",
-		lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentModel),
+		lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentRuntime, agentModel),
 	}, "\n")
 }
 
-func previewNoRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {
+func previewNoRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	return strings.Join([]string{
 		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
-		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentModel),
+		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentRuntime, agentModel),
 		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
 		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
 	}, "\n")

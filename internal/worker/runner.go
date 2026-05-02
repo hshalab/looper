@@ -360,6 +360,7 @@ type Options struct {
 	AllowAutoPush                   bool
 	OpenPRStrategy                  config.OpenPRStrategy
 	Disclosure                      *config.DisclosureConfig
+	AgentRuntime                    string
 	CustomInstructions              *config.Config
 	AgentModel                      *string
 	RetryBaseDelay                  time.Duration
@@ -394,6 +395,7 @@ type Runner struct {
 	githubCLICheck          func(context.Context, string, string) bool
 	openPRStrategy          config.OpenPRStrategy
 	disclosure              config.DisclosureConfig
+	agentRuntime            string
 	customInstructions      config.Config
 	agentModel              string
 	retryBaseDelay          time.Duration
@@ -590,6 +592,7 @@ func New(options Options) *Runner {
 		githubCLICheck:          options.GitHubCLIAutoPROpeningAvailable,
 		openPRStrategy:          strategy,
 		disclosure:              disclosureCfg,
+		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentModel:              derefString(options.AgentModel),
 		retryBaseDelay:          retryBaseDelay,
@@ -1114,7 +1117,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		return checkpoint, err
 	}
 	if !executionCompleted {
-		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, r.agentModel)
+		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, r.agentRuntime, r.agentModel)
 		if err != nil {
 			return checkpoint, err
 		}
@@ -2232,14 +2235,14 @@ func implementationPullRequestTitle(work workerInput) string {
 	return title
 }
 
-func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, error) {
+func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _, err := buildWorkerPromptWithInstructions(repoRootPath, "", cfg, work, plan, allowAgentPRCreation, disclosureCfg, agentModel)
+	prompt, _, err := buildWorkerPromptWithInstructions(repoRootPath, "", cfg, work, plan, allowAgentPRCreation, disclosureCfg, agentRuntime, agentModel)
 	return prompt, err
 }
 
-func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, config.CustomInstructionBlock, error) {
+func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, fmt.Sprintf("Continue implementing on existing pull request %s#%d.", work.Repo, work.PRNumber))
@@ -2270,10 +2273,10 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 	if allowAgentPRCreation {
 		parts = append(parts, buildAgentPullRequestInstruction(work))
 		parts = append(parts, "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state.")
-		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentModel))
+		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
 		parts = append(parts, "Make the necessary code changes, validate them, and leave the branch ready for PR creation.")
-		parts = append(parts, noRemoteLifecyclePromptInstruction("worker", work.Branch, work.BaseBranch, disclosureCfg, agentModel))
+		parts = append(parts, noRemoteLifecyclePromptInstruction("worker", work.Branch, work.BaseBranch, disclosureCfg, agentRuntime, agentModel))
 	}
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock, nil
 }
@@ -2287,11 +2290,11 @@ func customInstructionConfig(value *config.Config) config.Config {
 	return *value
 }
 
-func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {
+func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	return strings.Join([]string{
 		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
-		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentModel),
+		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentRuntime, agentModel),
 		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
 		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
 	}, "\n")

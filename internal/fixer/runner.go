@@ -281,6 +281,7 @@ type Options struct {
 	FixAllPullRequests      bool
 	DiscoveryPolicy         DiscoveryPolicy
 	Disclosure              *config.DisclosureConfig
+	AgentRuntime            string
 	CustomInstructions      *config.Config
 	AgentModel              *string
 	Sleep                   func(time.Duration)
@@ -315,6 +316,7 @@ type Runner struct {
 	fixAllPullRequests      bool
 	discoveryPolicy         DiscoveryPolicy
 	disclosure              config.DisclosureConfig
+	agentRuntime            string
 	customInstructions      config.Config
 	agentModel              string
 	sleep                   func(time.Duration)
@@ -520,6 +522,7 @@ func New(options Options) *Runner {
 		fixAllPullRequests:      options.FixAllPullRequests,
 		discoveryPolicy:         policy,
 		disclosure:              disclosureCfg,
+		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		agentModel:              derefString(options.AgentModel),
 		sleep:                   sleep,
@@ -1101,7 +1104,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, detailHeadSHA(checkpoint.Detail), checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentModel)
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, detailHeadSHA(checkpoint.Detail), checkpoint.FixItems, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -1972,7 +1975,7 @@ func hashFixItems(items []FixItem) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, headSHA string, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentModel string) (string, config.CustomInstructionBlock) {
+func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, headSHA string, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
 	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber)}
 	if headSHA != "" {
 		parts = append(parts, "Head SHA: "+headSHA)
@@ -1992,10 +1995,10 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 	}
 	if allowAutoPush {
 		parts = append(parts, "Commit and push the repair changes to the current PR branch when you can do so safely; Looper will reconcile any missing repository actions after your edits.")
-		parts = append(parts, lifecycle.PromptInstruction("fixer", "", "", true, false, disclosureCfg, agentModel))
+		parts = append(parts, lifecycle.PromptInstruction("fixer", "", "", true, false, disclosureCfg, agentRuntime, agentModel))
 	} else {
 		parts = append(parts, "Do not push the branch or update remote pull request state; leave repository publishing for Looper/manual follow-up after your edits.")
-		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentModel))
+		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
 	}
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 }
@@ -2009,11 +2012,11 @@ func customInstructionConfig(value *config.Config) config.Config {
 	return *value
 }
 
-func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentModel string) string {
+func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	return strings.Join([]string{
 		"Agent-managed git/PR lifecycle policy: remote actions disabled by Looper configuration.",
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
-		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentModel),
+		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentRuntime, agentModel),
 		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
 		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
 	}, "\n")
