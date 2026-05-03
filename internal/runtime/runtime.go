@@ -648,43 +648,64 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	if err != nil {
 		return RecoverySummary{}, err
 	}
+	loopsByID := make(map[string]storage.LoopRecord, len(loops))
+	for _, loop := range loops {
+		loopsByID[loop.ID] = loop
+	}
+	activeAgentRunIDs := make(map[string]struct{})
+	if repositories.Runs != nil {
+		runningRuns, err := repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
+		if err != nil {
+			return RecoverySummary{}, err
+		}
+		if repositories.AgentExecutions != nil {
+			activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
+			if err != nil {
+				return RecoverySummary{}, err
+			}
+			activeAgentRunIDs = make(map[string]struct{}, len(activeExecutions))
+			for _, execution := range activeExecutions {
+				if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" || execution.PID == nil || *execution.PID <= 0 {
+					continue
+				}
+				matches, running, err := r.executionMatchesProcess(ctx, execution, int(*execution.PID))
+				if err != nil {
+					if r.logger != nil {
+						r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error()})
+					}
+					continue
+				}
+				if running && matches {
+					activeAgentRunIDs[*execution.RunID] = struct{}{}
+				}
+			}
+		}
+		for _, run := range runningRuns {
+			loop, ok := loopsByID[run.LoopID]
+			if !ok {
+				continue
+			}
+			latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, run.LoopID)
+			if err != nil {
+				return RecoverySummary{}, err
+			}
+			_, hasActiveAgent := activeAgentRunIDs[run.ID]
+			if !shouldInterruptStaleRunningRun(run, latestRun, hasActiveAgent) {
+				continue
+			}
+			if err := interruptRecoveryRun(ctx, repositories, run, loop, nowISO, "Interrupted stale/orphaned running run during looperd recovery"); err != nil {
+				return RecoverySummary{}, err
+			}
+			summary.InterruptedRunsMarked += 1
+			eventsWritten += 1
+		}
+	}
 	requeuedLoopIDs := make(map[string]struct{})
 	for _, loop := range loops {
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
 			return RecoverySummary{}, err
 		}
-		if latestRun != nil && latestRun.Status == "running" {
-			interrupted := *latestRun
-			interrupted.Status = "interrupted"
-			if interrupted.ErrorMessage == nil {
-				interrupted.ErrorMessage = stringPtr("Interrupted during looperd recovery")
-			}
-			interrupted.EndedAt = stringPtr(nowISO)
-			interrupted.UpdatedAt = nowISO
-			if err := repositories.Runs.Upsert(ctx, interrupted); err != nil {
-				return RecoverySummary{}, err
-			}
-			*latestRun = interrupted
-			summary.InterruptedRunsMarked += 1
-			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-				ID:         newRuntimeEventID(),
-				EventType:  "looperd.recovery.run_interrupted",
-				LoopID:     stringPtr(loop.ID),
-				RunID:      stringPtr(latestRun.ID),
-				EntityType: stringPtr("run"),
-				EntityID:   stringPtr(latestRun.ID),
-				PayloadJSON: mustMarshalJSON(map[string]any{
-					"previousStatus":  "running",
-					"recoveredStatus": "interrupted",
-				}),
-				CreatedAt: nowISO,
-			}); err != nil {
-				return RecoverySummary{}, err
-			}
-			eventsWritten += 1
-		}
-
 		latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
 			return RecoverySummary{}, err
@@ -739,7 +760,8 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			continue
 		}
 
-		if shouldRequeueLoop(loop, latestRun) {
+		_, latestRunHasActiveAgent := activeAgentRunIDs[derefRunID(latestRun)]
+		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent) {
 			requeuedLoop := loop
 			requeuedLoop.Status = "queued"
 			requeuedLoop.NextRunAt = stringPtr(nowISO)
@@ -952,6 +974,49 @@ func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Reposito
 		return err
 	}
 	return repositories.Queue.Upsert(ctx, queueRecord)
+}
+
+func shouldInterruptStaleRunningRun(run storage.RunRecord, latestRun *storage.RunRecord, hasActiveAgent bool) bool {
+	if run.Status != string(domain.RunStatusRunning) {
+		return false
+	}
+	if latestRun == nil || latestRun.ID != run.ID {
+		return true
+	}
+	if hasActiveAgent {
+		return false
+	}
+	// Recovery runs during daemon startup, so a persisted running run without an
+	// active agent execution is orphaned regardless of loop status or heartbeat.
+	return true
+}
+
+func interruptRecoveryRun(ctx context.Context, repositories *storage.Repositories, run storage.RunRecord, loop storage.LoopRecord, nowISO string, message string) error {
+	interrupted := run
+	interrupted.Status = string(domain.RunStatusInterrupted)
+	if interrupted.ErrorMessage == nil {
+		interrupted.ErrorMessage = stringPtr(message)
+	}
+	interrupted.EndedAt = stringPtr(nowISO)
+	interrupted.LastHeartbeatAt = stringPtr(nowISO)
+	interrupted.UpdatedAt = nowISO
+	if err := repositories.Runs.Upsert(ctx, interrupted); err != nil {
+		return err
+	}
+	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:         newRuntimeEventID(),
+		EventType:  "looperd.recovery.run_interrupted",
+		ProjectID:  stringPtr(loop.ProjectID),
+		LoopID:     stringPtr(loop.ID),
+		RunID:      stringPtr(run.ID),
+		EntityType: stringPtr("run"),
+		EntityID:   stringPtr(run.ID),
+		PayloadJSON: mustMarshalJSON(map[string]any{
+			"previousStatus":  "running",
+			"recoveredStatus": "interrupted",
+		}),
+		CreatedAt: nowISO,
+	})
 }
 
 func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts int64) (storage.QueueItemRecord, bool, error) {
@@ -1522,7 +1587,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord) bool {
+func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasActiveAgent bool) bool {
 	if loop.Status == "paused" {
 		return false
 	}
@@ -1532,8 +1597,18 @@ func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord) bo
 	if latestRun == nil {
 		return loop.Status == "running"
 	}
+	if latestRun.Status == string(domain.RunStatusRunning) && latestRunHasActiveAgent {
+		return false
+	}
 
 	return loop.Status == "running" || latestRun.Status == "interrupted"
+}
+
+func derefRunID(run *storage.RunRecord) string {
+	if run == nil {
+		return ""
+	}
+	return run.ID
 }
 
 func normalizeStaleQueuedLoopStatus(latestRun storage.RunRecord) string {
