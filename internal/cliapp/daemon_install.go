@@ -2,8 +2,6 @@ package cliapp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +27,11 @@ type daemonInstallResult struct {
 	InstallPath    string  `json:"installPath"`
 	DownloadedFrom *string `json:"downloadedFrom"`
 	Skipped        bool    `json:"skipped"`
+}
+
+type preparedDaemonInstall struct {
+	result      daemonInstallResult
+	binaryBytes []byte
 }
 
 type githubReleasePayload struct {
@@ -70,14 +73,25 @@ func (r *commandRuntime) daemonInstall(cmd *cobra.Command, args []string) error 
 }
 
 func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, tag string, progress io.Writer) (daemonInstallResult, error) {
-	homeDir, err := r.homeDir()
+	prepared, err := r.prepareManagedDaemonInstall(ctx, force, tag, progress)
 	if err != nil {
 		return daemonInstallResult{}, err
+	}
+	if err := commitPreparedDaemonInstall(prepared); err != nil {
+		return daemonInstallResult{}, err
+	}
+	return prepared.result, nil
+}
+
+func (r *commandRuntime) prepareManagedDaemonInstall(ctx context.Context, force bool, tag string, progress io.Writer) (preparedDaemonInstall, error) {
+	homeDir, err := r.homeDir()
+	if err != nil {
+		return preparedDaemonInstall{}, err
 	}
 
 	target, err := resolveLooperdTarget(r.platform(), r.arch())
 	if err != nil {
-		return daemonInstallResult{}, err
+		return preparedDaemonInstall{}, err
 	}
 
 	installDir := filepath.Join(homeDir, ".looper", "bin")
@@ -85,66 +99,62 @@ func (r *commandRuntime) installManagedDaemon(ctx context.Context, force bool, t
 	if !force {
 		state, err := r.checkManagedDaemonBinary(ctx)
 		if err != nil {
-			return daemonInstallResult{}, err
+			return preparedDaemonInstall{}, err
 		}
 		if state.Exists {
-			return daemonInstallResult{Target: target, InstallPath: installPath, Skipped: true}, nil
+			return preparedDaemonInstall{result: daemonInstallResult{Target: target, InstallPath: installPath, Skipped: true}}, nil
 		}
 	}
 
 	release, err := r.fetchReleaseMetadata(ctx, tag)
 	if err != nil {
-		return daemonInstallResult{}, err
+		return preparedDaemonInstall{}, err
 	}
 
-	binaryAsset, checksumAsset, err := findLooperdReleaseAssets(release, target)
+	asset, err := findReleaseAssetSet(release, looperdBinaryName+"-"+target)
 	if err != nil {
-		return daemonInstallResult{}, err
+		return preparedDaemonInstall{}, fmt.Errorf("looperd release: %w", err)
 	}
 
-	binaryBytes, err := r.downloadBinary(ctx, binaryAsset.BrowserDownloadURL, binaryAsset.Name, progress)
+	binaryBytes, err := r.fetchAndExtractBinary(ctx, asset, progress)
 	if err != nil {
-		return daemonInstallResult{}, err
+		return preparedDaemonInstall{}, err
 	}
 
-	checksumText, err := r.downloadChecksum(ctx, checksumAsset.BrowserDownloadURL)
-	if err != nil {
-		return daemonInstallResult{}, err
-	}
+	return preparedDaemonInstall{
+		result: daemonInstallResult{
+			Target:         target,
+			InstallPath:    installPath,
+			DownloadedFrom: stringPtr(asset.PreferredURL),
+			Skipped:        false,
+		},
+		binaryBytes: binaryBytes,
+	}, nil
+}
 
-	expectedChecksum, err := parseChecksum(checksumText)
-	if err != nil {
-		return daemonInstallResult{}, err
+func commitPreparedDaemonInstall(prepared preparedDaemonInstall) error {
+	if prepared.result.Skipped {
+		return nil
 	}
-	actualChecksum := sha256.Sum256(binaryBytes)
-	if hex.EncodeToString(actualChecksum[:]) != expectedChecksum {
-		return daemonInstallResult{}, fmt.Errorf("Downloaded looperd checksum mismatch: expected %s, received %s", expectedChecksum, hex.EncodeToString(actualChecksum[:]))
-	}
-
+	installDir := filepath.Dir(prepared.result.InstallPath)
 	if err := os.MkdirAll(installDir, 0o755); err != nil {
-		return daemonInstallResult{}, fmt.Errorf("create install directory: %w", err)
+		return fmt.Errorf("create install directory: %w", err)
 	}
 
-	tempInstallPath := installPath + ".new"
-	if err := os.WriteFile(tempInstallPath, binaryBytes, 0o755); err != nil {
+	tempInstallPath := prepared.result.InstallPath + ".new"
+	if err := os.WriteFile(tempInstallPath, prepared.binaryBytes, 0o755); err != nil {
 		_ = removeTempInstallFile(tempInstallPath)
-		return daemonInstallResult{}, err
+		return err
 	}
 	if err := os.Chmod(tempInstallPath, 0o755); err != nil {
 		_ = removeTempInstallFile(tempInstallPath)
-		return daemonInstallResult{}, err
+		return err
 	}
-	if err := os.Rename(tempInstallPath, installPath); err != nil {
+	if err := os.Rename(tempInstallPath, prepared.result.InstallPath); err != nil {
 		_ = removeTempInstallFile(tempInstallPath)
-		return daemonInstallResult{}, err
+		return err
 	}
-
-	return daemonInstallResult{
-		Target:         target,
-		InstallPath:    installPath,
-		DownloadedFrom: stringPtr(binaryAsset.BrowserDownloadURL),
-		Skipped:        false,
-	}, nil
+	return nil
 }
 
 func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (githubReleasePayload, error) {
@@ -268,7 +278,7 @@ func (p *downloadProgress) print(initial bool) {
 		if p.total > 0 {
 			percent = int((p.read * 100) / p.total)
 		}
-		line = fmt.Sprintf("Downloading %s: %s / %s (%d%%)", p.name, formatDownloadBytes(p.read), formatDownloadBytes(p.total), percent)
+		line = fmt.Sprintf("Downloading %s: %s%s / %s (%d%%)", p.name, renderProgressBar(percent, downloadProgressBarWidth), formatDownloadBytes(p.read), formatDownloadBytes(p.total), percent)
 	} else if p.read > 0 {
 		line = fmt.Sprintf("Downloading %s: %s downloaded", p.name, formatDownloadBytes(p.read))
 	} else {
@@ -279,6 +289,42 @@ func (p *downloadProgress) print(initial bool) {
 		return
 	}
 	_, _ = fmt.Fprintf(p.w, "\r%s", line)
+}
+
+// downloadProgressBarWidth is the inner width of the textual progress bar
+// printed alongside byte counters. A small fixed width keeps output readable
+// on narrow terminals and stable in non-TTY logs.
+const downloadProgressBarWidth = 20
+
+// renderProgressBar returns a "[####------] " style bar string for the given
+// percentage. An empty string is returned when width is non-positive so the
+// renderer can be disabled by callers without conditional logic at the call
+// site.
+func renderProgressBar(percent int, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	filled := (percent * width) / 100
+	if filled > width {
+		filled = width
+	}
+	var builder strings.Builder
+	builder.Grow(width + 3)
+	builder.WriteByte('[')
+	for i := 0; i < filled; i++ {
+		builder.WriteByte('#')
+	}
+	for i := filled; i < width; i++ {
+		builder.WriteByte('-')
+	}
+	builder.WriteString("] ")
+	return builder.String()
 }
 
 func formatDownloadBytes(value int64) string {
@@ -338,35 +384,6 @@ func buildGitHubReleaseAPIURL(owner, repo, tag string) string {
 		return base + "/tags/" + tag
 	}
 	return base + "/latest"
-}
-
-func findLooperdReleaseAssets(release githubReleasePayload, target string) (githubReleaseAsset, githubReleaseAsset, error) {
-	binaryName := looperdBinaryName + "-" + target
-	checksumName := binaryName + ".sha256"
-
-	var binary githubReleaseAsset
-	var checksum githubReleaseAsset
-	for _, asset := range release.Assets {
-		switch asset.Name {
-		case binaryName:
-			binary = asset
-		case checksumName:
-			checksum = asset
-		}
-	}
-
-	missing := make([]string, 0, 2)
-	if strings.TrimSpace(binary.Name) == "" {
-		missing = append(missing, binaryName)
-	}
-	if strings.TrimSpace(checksum.Name) == "" {
-		missing = append(missing, checksumName)
-	}
-	if len(missing) > 0 {
-		return githubReleaseAsset{}, githubReleaseAsset{}, fmt.Errorf("GitHub release is missing required looperd asset(s): %s", strings.Join(missing, ", "))
-	}
-
-	return binary, checksum, nil
 }
 
 func parseChecksum(value string) (string, error) {

@@ -539,6 +539,74 @@ func TestUpgradeWithoutFlagsContinuesWithDaemonWhenCLISelfUpgradeRefused(t *test
 	}
 }
 
+func TestUpgradeWithoutFlagsDoesNotInstallDaemonWhenCLIUpgradeFails(t *testing.T) {
+	homeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(homeDir, ".looper", "worktrees"), 0o755); err != nil {
+		t.Fatalf("create test worktree root: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+
+	execPath := filepath.Join(homeDir, ".looper", "bin", "looper")
+	if err := os.MkdirAll(filepath.Dir(execPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(exec dir): %v", err)
+	}
+	if err := os.WriteFile(execPath, []byte("old-cli"), 0o755); err != nil {
+		t.Fatalf("WriteFile(execPath): %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	cliBinary := []byte("corrupt-cli")
+	cliChecksum := sha256.Sum256([]byte("different-cli"))
+	daemonBinary := []byte("new-daemon-binary")
+	daemonChecksum := sha256.Sum256(daemonBinary)
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		Platform:       "darwin",
+		Arch:           "arm64",
+		ExecutablePath: execPath,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "http://127.0.0.1:4321/api/v1/status":
+				return nil, fmt.Errorf("daemon offline")
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest",
+				"https://api.github.com/repos/nexu-io/looper/releases/tags/v9.9.9":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v9.9.9","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"},{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			case "https://example.invalid/looper-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, cliBinary), nil
+			case "https://example.invalid/looper-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, hex.EncodeToString(cliChecksum[:])+"  looper-darwin-arm64\n"), nil
+			case "https://example.invalid/looperd-darwin-arm64":
+				return binaryResponse(t, http.StatusOK, daemonBinary), nil
+			case "https://example.invalid/looperd-darwin-arm64.sha256":
+				return textResponse(t, http.StatusOK, hex.EncodeToString(daemonChecksum[:])+"  looperd-darwin-arm64\n"), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		}),
+	})
+
+	exitCode := app.Run(context.Background(), []string{"upgrade", "--config", configPath})
+	if exitCode == 0 {
+		t.Fatalf("Run([upgrade]) exit code = %d, want non-zero", exitCode)
+	}
+	if _, err := os.Stat(managedPath); !os.IsNotExist(err) {
+		t.Fatalf("Stat(%q) error = %v, want daemon install to be skipped", managedPath, err)
+	}
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64") {
+		t.Fatalf("stderr = %q, want daemon lane to have started download prep", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Installed looperd") {
+		t.Fatalf("stdout = %q, did not expect daemon install output", stdout.String())
+	}
+}
+
 func TestUpgradeWithoutFlagsWritesSingleJSONDocument(t *testing.T) {
 	homeDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(homeDir, ".looper", "worktrees"), 0o755); err != nil {
@@ -594,7 +662,7 @@ func TestUpgradeWithoutFlagsWritesSingleJSONDocument(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([upgrade --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 4 B / 4 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 4 B / 4 B (100%)") {
 		t.Fatalf("Run([upgrade --json]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "Proceeding with daemon upgrade") {
@@ -759,7 +827,7 @@ func TestUpgradeCLIPrintsDownloadProgressToStderr(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([upgrade --cli]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looper-darwin-arm64: 10 B / 10 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloading looper-darwin-arm64: [####################] 10 B / 10 B (100%)") {
 		t.Fatalf("stderr = %q, want CLI download progress", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "Downloading looper-darwin-arm64") {
@@ -843,7 +911,7 @@ func TestUpgradeDaemonPrintsRestartHint(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([upgrade --daemon]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 4 B / 4 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 4 B / 4 B (100%)") {
 		t.Fatalf("Run([upgrade --daemon]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Upgraded looperd 0.2.1 → 0.3.0") {
@@ -953,7 +1021,7 @@ func TestUpgradeDaemonInstallsManagedBinaryWhenOnlyPathBinaryExists(t *testing.T
 	if exitCode != 0 {
 		t.Fatalf("Run([upgrade --daemon]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: 4 B / 4 B (100%)") {
+	if !strings.Contains(stderr.String(), "Downloading looperd-darwin-arm64: [####################] 4 B / 4 B (100%)") {
 		t.Fatalf("Run([upgrade --daemon]) stderr = %q, want daemon download progress", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Installed managed looperd 0.4.0") {
