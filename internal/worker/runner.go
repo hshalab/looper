@@ -146,6 +146,20 @@ type CreatePullRequestResult struct {
 	URL    string
 }
 
+type CompareBranchesInput struct {
+	Repo       string
+	BaseBranch string
+	HeadBranch string
+	CWD        string
+}
+
+type CompareBranchesResult struct {
+	AheadBy      int
+	BehindBy     int
+	Status       string
+	TotalCommits int
+}
+
 type UpdatePullRequestTitleInput struct {
 	Repo     string
 	PRNumber int64
@@ -212,6 +226,7 @@ type GitHubGateway interface {
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
+	CompareBranches(context.Context, CompareBranchesInput) (CompareBranchesResult, error)
 	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	UpdatePullRequestTitle(context.Context, UpdatePullRequestTitleInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -841,9 +856,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		claimedLockKey = checkpoint.ClaimedLockKey
 	}
 	if claimedLockKey != "" {
-		nowISO := r.nowISO()
-		reason := "worker-run-resume"
-		acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: claimedLockKey, Owner: queueItem.ID, Reason: &reason, ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(r.claimTTL)), CreatedAt: nowISO, UpdatedAt: nowISO})
+		acquired, err := r.reacquireClaimedLock(ctx, claimedLockKey, queueItem.ID)
 		if err != nil {
 			return ProcessResult{}, err
 		}
@@ -871,6 +884,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}()
+	if resumedRun.Resumed {
+		result, handled, err := r.stopObsoleteResumedIssueRun(ctx, *project, *loop, run, queueItem, &checkpoint, &claimedLockKey)
+		if err != nil || handled {
+			return result, err
+		}
+	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
@@ -958,7 +977,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &latest, issueClaimStatusForFailure(latest, failedQueue, failure.kind), failure.message)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
-		if step == stepPrepareWork {
+		if step == stepPrepareWork && checkpoint.SkipReason == "" {
 			claimedLockKey = checkpoint.ClaimedLockKey
 			acquiredClaimedLock = claimedLockKey != ""
 		}
@@ -1017,8 +1036,127 @@ func (r *Runner) executeStep(ctx context.Context, step WorkerStep, input stepInp
 	}
 }
 
+func (r *Runner) reacquireClaimedLock(ctx context.Context, claimedLockKey string, owner string) (bool, error) {
+	nowISO := r.nowISO()
+	reason := "worker-run-resume"
+	expiresAt := eventlog.FormatJavaScriptISOString(r.now().Add(r.claimTTL))
+	acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: claimedLockKey, Owner: owner, Reason: &reason, ExpiresAt: expiresAt, CreatedAt: nowISO, UpdatedAt: nowISO})
+	if err != nil {
+		return false, err
+	}
+	if acquired {
+		return true, nil
+	}
+	lock, err := r.repos.Locks.Get(ctx, claimedLockKey)
+	if err != nil {
+		return false, err
+	}
+	if lock == nil || lock.Owner != owner {
+		return false, nil
+	}
+	refreshed, err := r.repos.Locks.Refresh(ctx, storage.LockRecord{Key: claimedLockKey, Owner: owner, Reason: &reason, ExpiresAt: expiresAt, UpdatedAt: nowISO})
+	if err != nil {
+		return false, err
+	}
+	return refreshed, nil
+}
+
+func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint *workerCheckpoint, claimedLockKey *string) (ProcessResult, bool, error) {
+	if checkpoint == nil || checkpoint.Work == nil || checkpoint.Work.ExecutionMode != "create-pr" || checkpoint.Work.IssueNumber <= 0 || r.github == nil {
+		return ProcessResult{}, false, nil
+	}
+	if err := r.validateWorkerIssueStillOpen(ctx, project.RepoPath, *checkpoint.Work); err == nil {
+		return ProcessResult{}, false, nil
+	} else if !isWorkerIssueTargetObsolete(err) {
+		return ProcessResult{}, false, nil
+	} else {
+		if checkpoint.ClaimedLockKey != "" {
+			if err := r.repos.Locks.Release(context.Background(), checkpoint.ClaimedLockKey); err != nil {
+				return ProcessResult{}, true, err
+			}
+			checkpoint.ClaimedLockKey = ""
+		}
+		if claimedLockKey != nil {
+			*claimedLockKey = ""
+		}
+		checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is no longer an open issue", formatIssueReference(issueLookupRepo(*checkpoint.Work), checkpoint.Work.IssueNumber))
+		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+		summary := r.buildSuccessSummary(loop, *checkpoint)
+		completedRun, err := r.completeRun(ctx, run, "success", summary, "", *checkpoint)
+		if err != nil {
+			return ProcessResult{}, true, err
+		}
+		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+			return ProcessResult{}, true, err
+		}
+		if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+			updated.Status = "completed"
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+		}); err != nil {
+			return ProcessResult{}, true, err
+		}
+		r.syncIssueClaim(ctx, stepInput{Project: project, Loop: loop, Run: completedRun, QueueItem: queueItem}, checkpoint, issueClaimStatusPaused, summary)
+		r.notifyRunCompleted(ctx, buildRunCompletedInput(project, loop, completedRun, *checkpoint, statusForCheckpoint(*checkpoint), "", summary))
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, true, nil
+	}
+}
+
+func (r *Runner) validateWorkerIssueStillOpen(ctx context.Context, cwd string, work workerInput) error {
+	if r.github == nil || work.ExecutionMode != "create-pr" || work.IssueNumber <= 0 {
+		return nil
+	}
+	lookupRepo := issueLookupRepo(work)
+	issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: lookupRepo, IssueNumber: work.IssueNumber, CWD: cwd})
+	if err != nil {
+		return err
+	}
+	return validateWorkerIssueTarget(lookupRepo, work.IssueNumber, issue)
+}
+
+func isWorkerIssueTargetObsolete(err error) bool {
+	var loopErr *loopError
+	return errors.As(err, &loopErr) && loopErr.kind == FailureNonRetryable
+}
+
+func (r *Runner) workerBranchAheadOfBase(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree) (bool, error) {
+	branch := firstNonEmpty(worktree.Branch, work.Branch)
+	if branch == "" || work.BaseBranch == "" {
+		return true, nil
+	}
+	if r.github != nil && work.Repo != "" {
+		comparison, err := r.github.CompareBranches(ctx, CompareBranchesInput{Repo: work.Repo, BaseBranch: work.BaseBranch, HeadBranch: branch, CWD: project.RepoPath})
+		if err != nil {
+			return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		return comparison.AheadBy > 0, nil
+	}
+	if r.git == nil {
+		return true, nil
+	}
+	worktreeRoot, err := workerWorktreeRoot(project)
+	if err != nil {
+		return false, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: work.BaseBranch})
+	if err != nil {
+		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	return len(inspect.NewCommitSHAs) > 0, nil
+}
+
 func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	if checkpoint.Work != nil {
+		if err := r.validateWorkerIssueStillOpen(ctx, input.Project.RepoPath, *checkpoint.Work); err != nil {
+			if isWorkerIssueTargetObsolete(err) {
+				checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is no longer an open issue", formatIssueReference(issueLookupRepo(*checkpoint.Work), checkpoint.Work.IssueNumber))
+				checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+				return checkpoint, nil
+			}
+			return checkpoint, err
+		}
+	}
 	work, err := r.resolveWorkerInput(ctx, input.Project, input.Loop, input.QueueItem, checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -1444,6 +1582,14 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if err != nil {
 		return checkpoint, err
 	}
+	if err := r.validateWorkerIssueStillOpen(ctx, input.Project.RepoPath, work); err != nil {
+		if isWorkerIssueTargetObsolete(err) {
+			checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is no longer an open issue", formatIssueReference(issueLookupRepo(work), work.IssueNumber))
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+			return checkpoint, nil
+		}
+		return checkpoint, err
+	}
 	if err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree); err != nil {
 		return checkpoint, err
 	}
@@ -1548,6 +1694,15 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	ahead, err := r.workerBranchAheadOfBase(ctx, input.Project, work, worktree)
+	if err != nil {
+		return checkpoint, err
+	}
+	if !ahead {
+		checkpoint.SkipReason = fmt.Sprintf("Worker stopped because branch %s has no commits ahead of %s", worktree.Branch, work.BaseBranch)
+		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+		return checkpoint, nil
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)

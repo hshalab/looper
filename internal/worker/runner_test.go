@@ -1400,6 +1400,188 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	}
 }
 
+func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{
+		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
+		createPRErrors: []error{fmt.Errorf("temporary create pr failure")},
+		issueDetailResponses: []IssueDetail{
+			{Number: 27, Title: "Implement worker loop", State: "OPEN"},
+			{Number: 27, Title: "Implement worker loop", State: "OPEN"},
+			{Number: 27, Title: "Implement worker loop", State: "CLOSED"},
+		},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim1, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	first, err := runner.ProcessClaimedItem(context.Background(), *claim1)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("first = %#v, want retryable_after_resume failure", first)
+	}
+	fixture.advance(5 * time.Second)
+	claim2, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	second, err := runner.ProcessClaimedItem(context.Background(), *claim2)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(second) error = %v", err)
+	}
+	if second.Status != "skipped" || !strings.Contains(second.Summary, "no longer an open issue") {
+		t.Fatalf("second = %#v, want skipped obsolete issue", second)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want resumed worker not to rerun agent", len(agent.starts))
+	}
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("len(github.createPRCalls) = %d, want no PR creation on obsolete resume", len(github.createPRCalls))
+	}
+}
+
+func TestProcessClaimedItemStopsResumedWorkerWhenIssueClosedReleasesPersistedLock(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	lockKey := "issue:acme/looper:27"
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Repo: "acme/looper", IssueNumber: 27, ExecutionMode: "create-pr", BaseBranch: "main"},
+		ClaimedLockKey: lockKey,
+		PullRequest:    &checkpointPullPR{Number: 101, URL: "https://example/pr/101"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_resume_issue_closed", LoopID: "loop_worker_1", Status: "failed", LastCompletedStep: stringPtr(string(stepPlan)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetailResponses: []IssueDetail{{Number: 27, Title: "Implement worker loop", State: "CLOSED"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: claim.ID, ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()})
+	if err != nil {
+		t.Fatalf("Locks.Acquire() seed error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("Locks.Acquire() seed = false, want persisted lock held by resumed queue item")
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "no longer an open issue") {
+		t.Fatalf("result = %#v, want skipped obsolete issue", result)
+	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want persisted claimed lock released", lock)
+	}
+	latestRun, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if latestRun == nil {
+		t.Fatal("latestRun = nil, want persisted skipped run")
+	}
+	latestCheckpoint, err := parseCheckpoint(latestRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint(latestRun) error = %v", err)
+	}
+	if latestCheckpoint.ClaimedLockKey != "" {
+		t.Fatalf("latestCheckpoint.ClaimedLockKey = %q, want cleared lock key", latestCheckpoint.ClaimedLockKey)
+	}
+	if latestCheckpoint.SkipReason == "" || !strings.Contains(latestCheckpoint.SkipReason, "no longer an open issue") {
+		t.Fatalf("latestCheckpoint.SkipReason = %q, want obsolete issue skip reason", latestCheckpoint.SkipReason)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil {
+		t.Fatal("queue = nil, want completed queue item")
+	}
+	if queue.TargetType != "issue" || queue.TargetID != lockKey {
+		t.Fatalf("queue target = (%q, %q), want original issue target", queue.TargetType, queue.TargetID)
+	}
+	if queue.LockKey == nil || *queue.LockKey != lockKey {
+		t.Fatalf("queue.LockKey = %#v, want original issue lock key", queue.LockKey)
+	}
+	if queue.PRNumber != nil {
+		t.Fatalf("queue.PRNumber = %#v, want nil after obsolete resume skip", queue.PRNumber)
+	}
+}
+
+func TestReacquireClaimedLockAllowsSameOwnerLiveLock(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	lockKey := "issue:acme/looper:27"
+	nowISO := fixture.nowISO()
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: "queue_worker_1", ExpiresAt: fixture.now().Add(time.Minute).UTC().Format("2006-01-02T15:04:05.000Z"), CreatedAt: nowISO, UpdatedAt: nowISO})
+	if err != nil {
+		t.Fatalf("Locks.Acquire() seed error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("Locks.Acquire() seed = false, want live lock for same owner")
+	}
+
+	acquired, err = runner.reacquireClaimedLock(context.Background(), lockKey, "queue_worker_1")
+	if err != nil {
+		t.Fatalf("reacquireClaimedLock() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("reacquireClaimedLock() = false, want same-owner live lock to be adopted")
+	}
+	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock == nil {
+		t.Fatal("lock = nil, want refreshed lock")
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, lock.ExpiresAt)
+	if err != nil {
+		t.Fatalf("time.Parse(lock.ExpiresAt) error = %v", err)
+	}
+	if !expiresAt.After(fixture.now().Add(9 * time.Minute)) {
+		t.Fatalf("lock.ExpiresAt = %q, want refreshed TTL near claim duration", lock.ExpiresAt)
+	}
+}
+
+func TestProcessClaimedItemSkipsPRCreationWhenBranchNotAhead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	compare := CompareBranchesResult{AheadBy: 0, BehindBy: 2, Status: "behind", TotalCommits: 0}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, compareResult: &compare}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "has no commits ahead of main") {
+		t.Fatalf("result = %#v, want skipped no-ahead branch", result)
+	}
+	if len(github.compareCalls) != 1 {
+		t.Fatalf("len(github.compareCalls) = %d, want branch comparison", len(github.compareCalls))
+	}
+	if len(github.createPRCalls) != 0 {
+		t.Fatalf("len(github.createPRCalls) = %d, want no PR creation", len(github.createPRCalls))
+	}
+}
+
 func TestFindPreviousIssueClaimPrefersNewestMatchingRun(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2733,6 +2915,8 @@ type fakeGitHubGateway struct {
 	prDetailResponses       []PullRequestDetail
 	viewPRIndex             int
 	issueDetail             IssueDetail
+	issueDetailResponses    []IssueDetail
+	viewIssueIndex          int
 	viewPRCalls             []ViewPullRequestInput
 	viewIssueCalls          []ViewIssueInput
 	createIssueCommentCalls []IssueCommentInput
@@ -2741,6 +2925,8 @@ type fakeGitHubGateway struct {
 	createPRResult          CreatePullRequestResult
 	createPRErrors          []error
 	createPRCalls           []CreatePullRequestInput
+	compareResult           *CompareBranchesResult
+	compareCalls            []CompareBranchesInput
 	updatePRTitleCalls      []UpdatePullRequestTitleInput
 	updatePRBodyCalls       []UpdatePullRequestBodyInput
 	updatePRTitleErrors     []error
@@ -2806,6 +2992,10 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (IssueDetail, error) {
 	f.viewIssueCalls = append(f.viewIssueCalls, input)
 	detail := f.issueDetail
+	if f.viewIssueIndex < len(f.issueDetailResponses) {
+		detail = f.issueDetailResponses[f.viewIssueIndex]
+	}
+	f.viewIssueIndex++
 	if detail.Number == 0 {
 		detail.Number = input.IssueNumber
 	}
@@ -2837,6 +3027,14 @@ func (f *fakeGitHubGateway) CreatePullRequest(_ context.Context, input CreatePul
 	}
 	f.createPRIndex++
 	return f.createPRResult, nil
+}
+
+func (f *fakeGitHubGateway) CompareBranches(_ context.Context, input CompareBranchesInput) (CompareBranchesResult, error) {
+	f.compareCalls = append(f.compareCalls, input)
+	if f.compareResult != nil {
+		return *f.compareResult, nil
+	}
+	return CompareBranchesResult{AheadBy: 1, Status: "ahead", TotalCommits: 1}, nil
 }
 
 func (f *fakeGitHubGateway) UpdatePullRequestTitle(_ context.Context, input UpdatePullRequestTitleInput) error {
