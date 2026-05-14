@@ -6485,7 +6485,7 @@ func defaultThreadResolutionPolicy(t *testing.T) config.ReviewerThreadResolution
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	return cfg.Reviewer.ThreadResolution
+	return cfg.Roles.Reviewer.Behavior.ThreadResolution
 }
 
 func threadResolutionStepInput() stepInput {

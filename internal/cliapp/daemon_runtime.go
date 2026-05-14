@@ -744,7 +744,32 @@ func splitLogLines(content string) []string {
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
-	return config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv)})
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv)})
+	if err != nil {
+		return config.LoadedFileConfig{}, err
+	}
+	r.emitConfigLoadNotices(loaded)
+	return loaded, nil
+}
+
+func (r *commandRuntime) emitConfigLoadNotices(loaded config.LoadedFileConfig) {
+	for _, warning := range loaded.Warnings {
+		key := "warning:" + warning
+		if _, ok := r.emittedConfigNotes[key]; ok {
+			continue
+		}
+		r.emittedConfigNotes[key] = struct{}{}
+		_, _ = fmt.Fprintf(r.app.stderr(), "warning: %s\n", warning)
+	}
+
+	for _, notice := range loaded.Notices {
+		key := "note:" + notice
+		if _, ok := r.emittedConfigNotes[key]; ok {
+			continue
+		}
+		r.emittedConfigNotes[key] = struct{}{}
+		_, _ = fmt.Fprintf(r.app.stderr(), "note: %s\n", notice)
+	}
 }
 
 func (r *commandRuntime) getJSONWithClient(ctx context.Context, client *DaemonAPIClient, path string) (json.RawMessage, error) {
