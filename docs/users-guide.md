@@ -92,7 +92,7 @@ The `triaged` label means Coordinator has formed an opinion about the issue. Bec
 
 ### Re-triage loop for `needs-info`
 
-If an issue is in the `unclear` state and the original author replies after `needs-info` was applied, Coordinator removes both `needs-info` and `triaged`. That returns the issue to the triage candidate set on a later poll without requiring the author to know Looper's label vocabulary.
+If an issue is in the `unclear` state and the original author replies after `needs-info` was applied, Coordinator removes both `needs-info` and `triaged` and immediately re-runs triage in the same poll. That lets the issue move back through triage without requiring the author to know Looper's label vocabulary.
 
 ### Cross-role boundary
 
