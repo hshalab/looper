@@ -352,10 +352,12 @@ func TestHandlerUnauthorized(t *testing.T) {
 	assertEqual(t, errMap["message"], "Authorization token is required")
 }
 
-func TestHandlerWebhookForwardAllowsLoopbackWithoutBearerToken(t *testing.T) {
+func TestHandlerWebhookForwardAcceptsLoopbackAndTriggersSchedulerTick(t *testing.T) {
 	fixture := newTestFixture(t)
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
+	fixture.config.Webhook.Enabled = true
+	triggered := 0
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder, TriggerSchedulerTick: func() { triggered++ }})
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
 	req.RemoteAddr = "127.0.0.1:1234"
@@ -365,16 +367,16 @@ func TestHandlerWebhookForwardAllowsLoopbackWithoutBearerToken(t *testing.T) {
 
 	h.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", recorder.Code)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", recorder.Code)
 	}
-	if forwarder.calls != 1 {
-		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	data := body["data"].(map[string]any)
-	assertEqual(t, data["status"], "accepted")
-	assertEqual(t, data["workItems"], float64(1))
+	assertEqual(t, data["accepted"], true)
+	assertEqual(t, triggered, 1)
 }
 
 func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T) {
@@ -382,6 +384,7 @@ func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T
 	token := "secret-token"
 	fixture.config.Server.AuthMode = config.AuthModeLocalToken
 	fixture.config.Server.LocalToken = &token
+	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
 	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
 
@@ -400,6 +403,37 @@ func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T
 	if forwarder.calls != 0 {
 		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
 	}
+}
+
+func TestHandlerWebhookForwardRejectsProxiedLoopbackRequests(t *testing.T) {
+	fixture := newTestFixture(t)
+	token := "secret-token"
+	fixture.config.Server.AuthMode = config.AuthModeLocalToken
+	fixture.config.Server.LocalToken = &token
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Forwarded-For", "203.0.113.5")
+	req.Header.Set("X-GitHub-Delivery", "delivery-3")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "UNAUTHORIZED")
+	assertEqual(t, errMap["message"], "Webhook forwarding does not accept proxied loopback requests")
 }
 
 func TestHandlerRouteAndMethodErrors(t *testing.T) {
@@ -911,6 +945,47 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsCreateRouteReturnsSuccessWhenWebhookRefreshFails(t *testing.T) {
+	t.Parallel()
+
+	nowISO := time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC).Format(javaScriptISOString)
+	h := NewHandler(Context{
+		Config: config.Config{Defaults: config.DefaultsConfig{BaseBranch: "main"}},
+		ProjectsService: fakeProjectService{
+			addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+				metadataJSON := `{"repo":null,"worktreeRoot":null,"source":"api"}`
+				return projects.AddResult{
+					Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				}, nil
+			},
+		},
+		Runtime: fixedRuntimeState{
+			refreshWebhookForwarders: func() error { return errors.New("refresh failed") },
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","name":"Looper"}`)))
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "looper")
+	assertEqual(t, data["name"], "Looper")
+	assertEqual(t, data["repoPath"], "/tmp/repos/looper")
+	assertEqual(t, data["baseBranch"], "main")
+	assertEqual(t, data["archived"], false)
+	assertEqual(t, data["discoveredPullRequests"], float64(0))
+	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	warnings, ok := data["warnings"].([]any)
+	if !ok || len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
+	}
+}
+
 func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
@@ -981,6 +1056,35 @@ func TestHandlerProjectsRemoveRouteReturnsNotFound(t *testing.T) {
 	errorMap := body["error"].(map[string]any)
 	assertEqual(t, errorMap["code"], "PROJECT_NOT_FOUND")
 	assertEqual(t, errorMap["message"], "Project not found: missing")
+}
+
+func TestHandlerProjectsRemoveRouteReturnsSuccessWhenWebhookRefreshFails(t *testing.T) {
+	t.Parallel()
+
+	removed := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper"}
+	h := NewHandler(Context{
+		Config: config.Config{Defaults: config.DefaultsConfig{BaseBranch: "main"}},
+		ProjectsService: fakeProjectService{
+			removeProject: func(context.Context, string) (storage.ProjectRecord, error) {
+				return removed, nil
+			},
+		},
+		Runtime: fixedRuntimeState{
+			refreshWebhookForwarders: func() error { return errors.New("refresh failed") },
+		},
+	})
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/project_1", nil)
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "project_1")
+	assertEqual(t, data["name"], "Looper")
 }
 
 func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
@@ -5287,7 +5391,8 @@ func (noopLogger) Error(string, map[string]any) {}
 var _ bootstrap.Logger = noopLogger{}
 
 type fixedRuntimeState struct {
-	services looperdruntime.Services
+	services                 looperdruntime.Services
+	refreshWebhookForwarders func() error
 }
 
 type errorInjectingQuerier struct {
@@ -5318,6 +5423,13 @@ func (s fixedRuntimeState) Services() looperdruntime.Services {
 
 func (s fixedRuntimeState) StartedAt() (time.Time, bool) {
 	return time.Time{}, false
+}
+
+func (s fixedRuntimeState) RefreshWebhookForwarders() error {
+	if s.refreshWebhookForwarders != nil {
+		return s.refreshWebhookForwarders()
+	}
+	return nil
 }
 
 func seedConflictProject(t *testing.T, service *projects.Service) {

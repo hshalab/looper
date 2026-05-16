@@ -116,6 +116,9 @@ type Runtime struct {
 	recoveryDone       chan struct{}
 	activeExecutions   *ActiveExecutionRegistry
 	githubGateway      *githubinfra.Gateway
+	webhookForwarders  *webhookForwarderManager
+	webhookContext     context.Context
+	webhookCancel      context.CancelFunc
 	webhookForwarder   WebhookForwarder
 	schedulerDisabled  bool
 	startupReadyOnce   sync.Once
@@ -211,6 +214,16 @@ func (r *Runtime) Stop(reason string) {
 		}
 
 		r.stopDeferredReviewerRecovery()
+		r.mu.RLock()
+		webhookCancel := r.webhookCancel
+		webhookForwarders := r.webhookForwarders
+		r.mu.RUnlock()
+		if webhookCancel != nil {
+			webhookCancel()
+		}
+		if webhookForwarders != nil {
+			webhookForwarders.Stop()
+		}
 		r.stopSchedulerLoop()
 
 		r.mu.Lock()
@@ -296,6 +309,37 @@ func (r *Runtime) RecoverySummary() RecoverySummary {
 	defer r.mu.RUnlock()
 
 	return r.recovery
+}
+
+func (r *Runtime) WebhookStatus() WebhookRuntimeStatus {
+	r.mu.RLock()
+	manager := r.webhookForwarders
+	r.mu.RUnlock()
+	if manager == nil {
+		return WebhookRuntimeStatus{}
+	}
+	return manager.Status()
+}
+
+func (r *Runtime) RefreshWebhookForwarders() error {
+	r.mu.RLock()
+	manager := r.webhookForwarders
+	repositories := r.services.Repositories
+	webhookCtx := r.webhookContext
+	stopped := r.stopped
+	r.mu.RUnlock()
+	if stopped || manager == nil || repositories == nil || repositories.Projects == nil || webhookCtx == nil {
+		return nil
+	}
+	projectsList, err := repositories.Projects.List(context.Background())
+	if err != nil {
+		return err
+	}
+	if err := webhookCtx.Err(); err != nil {
+		return nil
+	}
+	manager.Sync(webhookCtx, projectsList)
+	return nil
 }
 
 func (r *Runtime) start(ctx context.Context) error {
@@ -384,10 +428,22 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
+	webhookForwarderCtx, webhookCancel := context.WithCancel(context.Background())
+	defer func() {
+		if !started {
+			webhookCancel()
+		}
+	}()
+	webhookForwarders := newWebhookForwarderManager(webhookForwarderManagerOptions{Config: r.config, Logger: r.logger, Now: r.now, StopTimeout: r.shutdownTimeout})
 	startedAt := r.now().UTC()
 	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
 		return err
 	}
+	projectsList, err := repositories.Projects.List(context.Background())
+	if err != nil {
+		return err
+	}
+	webhookForwarders.Sync(webhookForwarderCtx, projectsList)
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
@@ -415,6 +471,9 @@ func (r *Runtime) start(ctx context.Context) error {
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
+	r.webhookForwarders = webhookForwarders
+	r.webhookContext = webhookForwarderCtx
+	r.webhookCancel = webhookCancel
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 
@@ -587,7 +646,7 @@ func runtimeShouldRetryDependencyError(err error) bool {
 }
 
 func (r *Runtime) startSchedulerLoop() {
-	pollInterval := time.Duration(r.config.Scheduler.PollIntervalSeconds) * time.Second
+	pollInterval := r.schedulerPollInterval()
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
 	wakeCh := make(chan struct{}, 1)
@@ -640,6 +699,14 @@ func (r *Runtime) startSchedulerLoop() {
 			}
 		}
 	}()
+}
+
+func (r *Runtime) schedulerPollInterval() time.Duration {
+	pollIntervalSeconds := r.config.Scheduler.PollIntervalSeconds
+	if r.config.Webhook.Enabled {
+		pollIntervalSeconds = r.config.Webhook.FallbackPollIntervalSeconds
+	}
+	return time.Duration(pollIntervalSeconds) * time.Second
 }
 
 func (r *Runtime) stopSchedulerLoop() {
