@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -136,9 +137,8 @@ func TestWebhookForwarderManagerStartsUniqueReposAndRetainsTail(t *testing.T) {
 		if item.command.Path != ghPath {
 			t.Fatalf("forwarder gh path = %q, want %q", item.command.Path, ghPath)
 		}
-		wantEvents := []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "check_run"}
-		if got := strings.Join(item.command.Events, ","); got != strings.Join(wantEvents, ",") {
-			t.Fatalf("forwarder events = %q, want %q", got, strings.Join(wantEvents, ","))
+		if got := strings.Join(item.command.Events, ","); got != strings.Join(webhookForwarderEvents, ",") {
+			t.Fatalf("forwarder events = %q, want %q", got, strings.Join(webhookForwarderEvents, ","))
 		}
 		if item.command.URL != "http://127.0.0.1:17310/webhook/forward" {
 			t.Fatalf("forwarder URL = %q, want loopback webhook URL", item.command.URL)
@@ -173,6 +173,13 @@ func TestWebhookForwarderManagerStartsUniqueReposAndRetainsTail(t *testing.T) {
 	}
 	if got := strings.Join(alpha.Tail, "\n"); !strings.Contains(got, "stdout: hello from stdout") || !strings.Contains(got, "stderr: warning from stderr") {
 		t.Fatalf("alpha tail = %q, want stdout/stderr lines retained", got)
+	}
+}
+
+func TestWebhookForwarderEventsIncludePush(t *testing.T) {
+	t.Parallel()
+	if !slices.Contains(webhookForwarderEvents, "push") {
+		t.Fatalf("webhookForwarderEvents = %v, want push subscription", webhookForwarderEvents)
 	}
 }
 
