@@ -29,7 +29,7 @@ A proactive, rule-based Role that retires stale or low-signal Issues and Pull Re
 _Avoid_: janitor, cleaner.
 
 **Coordinator**:
-A proactive, LLM-driven Role that performs Triage on fresh Issues and executes Dispatch.
+A proactive, LLM-driven Role that performs Triage on fresh Issues and executes Dispatch. In Network mode, Coordinator is also the control plane for Issue admission, PR review assignment, and exact Node targeting, gated by the Network Lease.
 _Avoid_: manager, commander, maintainer.
 
 ### Issue lifecycle
@@ -47,8 +47,8 @@ The act of putting an Issue into a state where Planner or Worker will discover i
 _Avoid_: handoff (overloaded — see below), route, promote, enqueue.
 
 **Trigger label**:
-The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role (e.g. Planner's trigger label is set in `roles.planner.triggers.labels`).
-_Avoid_: queue label, pickup label.
+The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role (e.g. Planner's trigger label is set in `roles.planner.triggers.labels`). In a Routed project, Worker still uses the generic `looper:worker-ready` Trigger label as work intent; exact Node targeting is expressed separately by `looper:target:<node_name>`.
+_Avoid_: queue label, pickup label, routed label, dispatched label, target label.
 
 **Veto signal**:
 A human-applied state on an Issue that blocks Coordinator's autonomous Dispatch. Examples: removing the `dispatch/*` label, applying `looper:hold`, or applying the trigger label manually.
@@ -78,14 +78,39 @@ The standard `<!-- looper:stamp v=1 -->` HTML comment plus visible footer applie
 **Self-dedup marker**:
 A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) used by a stateless Role to recognise its own prior comments and avoid duplicate posts.
 
+### Network
+
+**Network**:
+A coordinated set of `looperd` instances that share Coordinator admission/assignment decisions for a configured set of repositories. A Node joins exactly one Network at a time. Hosted by a `loopernet` instance (one Network per `loopernet`).
+
+**Node**:
+A single `looperd` instance enrolled in a Network. Identified by an opaque cloud-issued ID and a human-readable Name (short label-safe string; convention is to use a color, e.g. `red`, `blue`, `cyan`).
+_Avoid_: peer, member, instance, agent.
+
+**Coordinator control plane**:
+The Network-aware Coordinator responsibility that decides Issue admission and PR review assignment, then applies the GitHub state that Worker/Reviewer consume. In Routed projects it also applies an exact target label (`looper:target:<node_name>`) so a specific Node can claim the work.
+_Avoid_: router, dispatcher, scheduler, balancer.
+
+**Routed project**:
+A project whose `network.mode` is `routed`. Coordinator admission/assignment is performed by the current Network Lease holder. Worker/Reviewer claim only when the exact target label matches the local Node and the role-specific GitHub-native coarse target is present. The complement is a *local-only project*, whose Roles keep existing single-machine behaviour and ignore `looper:target:*` labels.
+
+**Target label**:
+A Network-only exact Node target label of the form `looper:target:<node_name>`. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim. Target labels are ignored in local-only projects.
+_Avoid_: trigger label, routed label, worker-ready suffix.
+
+**Lease**:
+The durable Authority for Network Coordinator control-plane leadership. A row in the `loopernet` database with a fencing token, validated at every GitHub side-effect boundary.
+
 ## Relationships
 
 - A **Coordinator** performs **Triage** on a fresh **Issue**, producing a **Disposition** plus classification labels
 - A **Coordinator** performs **Dispatch** on a Triaged Issue, producing a **Trigger label** that a **Planner** or **Worker** observes
+- A **Coordinator** may perform **PR review assignment**, producing a GitHub review request that **Reviewer** observes
 - A **Coordinator** consults the **Dependency gate** before performing **Dispatch** when `roles.coordinator.dependencies.enabled = true`
 - A **Sweeper** retires Issues and Pull Requests that have aged past their **Trigger label** or have an `out-of-scope` Disposition
 - **Coordinator** and **Sweeper** are both stateless and compose via shared label semantics, not direct calls
 - A **Veto signal** from a human overrides Coordinator's autonomous Dispatch but does not override **Triage** itself
+- In a **Routed project**, the **Coordinator control plane** applies GitHub-native coarse authority (`looper:worker-ready` plus assignee for Worker, review request for Reviewer) and writes the **Target label** last. The **Lease** gates Coordinator control-plane action; current GitHub issue/PR state remains the claim Authority.
 
 ## Flagged ambiguities
 
