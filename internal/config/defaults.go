@@ -208,7 +208,7 @@ func DefaultConfig(cwd string) (Config, error) {
 						MaxWallClockSeconds:       0,
 						MaxConsecutiveFailures:    3,
 						MaxAgentExecutionsPerPR:   25,
-						StopOnApproved:            true,
+						StopOnApproved:            false,
 						StopOnReadyLabel:          true,
 						StopOnIdenticalOutput:     true,
 					},

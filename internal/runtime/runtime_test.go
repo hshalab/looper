@@ -1902,6 +1902,7 @@ func TestRunRecoveryPipelineAutoRecoversFailedReviewerGuardrailLoop(t *testing.T
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
+	cfg.Roles.Reviewer.Behavior.Loop.StopOnApproved = true
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
 	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{})
 	if err != nil {
@@ -1966,6 +1967,7 @@ func TestRecoveryInterruptsOlderRunningRunWhenLatestCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
+	cfg.Roles.Reviewer.Behavior.Loop.StopOnApproved = true
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
 	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{})
 	if err != nil {
@@ -2287,6 +2289,7 @@ func TestRunRecoveryPipelineDefersReviewerLoginRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
+	cfg.Roles.Reviewer.Behavior.Loop.StopOnApproved = true
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
 	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
 	defer coordinator.Close()
@@ -2333,6 +2336,7 @@ func TestDeferredReviewerRecoveryRefreshesLoginAtMostOncePerProject(t *testing.T
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
+	cfg.Roles.Reviewer.Behavior.Loop.StopOnApproved = true
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
 	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
 	defer coordinator.Close()
@@ -2395,6 +2399,7 @@ func TestDeferredReviewerRecoveryDoesNotCacheFailedLoginRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
+	cfg.Roles.Reviewer.Behavior.Loop.StopOnApproved = true
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
 	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
 	defer coordinator.Close()
@@ -2457,6 +2462,7 @@ func TestDeferredReviewerRecoverySkipsLoopChangedAfterListing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
+	cfg.Roles.Reviewer.Behavior.Loop.StopOnApproved = true
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
 	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
 	defer coordinator.Close()
