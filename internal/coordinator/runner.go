@@ -1745,6 +1745,11 @@ func (r *Runner) commentHasWriteAccess(ctx context.Context, repo, cwd, author st
 	if allowed, ok := cache[strings.ToLower(author)]; ok {
 		return allowed, nil
 	}
+	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+	if err == nil && strings.EqualFold(strings.TrimSpace(currentLogin), author) {
+		cache[strings.ToLower(author)] = true
+		return true, nil
+	}
 	permission, err := r.github.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{Repo: repo, User: author, CWD: cwd})
 	if err != nil {
 		return false, err
