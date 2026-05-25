@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"slices"
 	"syscall"
 
 	"github.com/nexu-io/looper/internal/cliapp"
@@ -31,7 +30,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
-	if slices.Contains(args, "--version") {
+	if indexOf(args, "--version") >= 0 {
 		_, _ = fmt.Fprintln(stdout, version.Value)
 		return 0
 	}
@@ -52,4 +51,13 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 
 	app := newApp(cliapp.Deps{Stdout: stdout, Stderr: stderr})
 	return app.Run(ctx, args)
+}
+
+func indexOf(args []string, target string) int {
+	for i, arg := range args {
+		if arg == target {
+			return i
+		}
+	}
+	return -1
 }

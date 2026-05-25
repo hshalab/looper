@@ -3,11 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"os"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/cliapp"
 	"github.com/nexu-io/looper/internal/version"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
 
 type contextKey struct{}
 
@@ -149,13 +157,77 @@ func TestRunWithDepsVersionShortCircuitsBeforeAppConstruction(t *testing.T) {
 	}
 }
 
-func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
+func TestRunWithDepsVersionShortCircuitsBeforeTrailingFlags(t *testing.T) {
 	t.Parallel()
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
+	called := false
 
-	exitCode := run([]string{"version"}, stdout, stderr)
+	exitCode := runWithDeps([]string{"--version", "--json"}, stdout, stderr, runDeps{
+		newApp: func(cliapp.Deps) appRunner {
+			called = true
+			return fakeApp{run: func(context.Context, []string) int { return 99 }}
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("runWithDeps([--version --json]) exit code = %d, want 0", exitCode)
+	}
+	if called {
+		t.Fatal("newApp was called for --version with trailing flags")
+	}
+	if got, want := stdout.String(), version.Value+"\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty string", got)
+	}
+}
+
+func TestRunWithDepsVersionShortCircuitsAfterLeadingGlobalFlags(t *testing.T) {
+	t.Parallel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	called := false
+
+	exitCode := runWithDeps([]string{"--json", "--config", "/tmp/looper.json", "--version"}, stdout, stderr, runDeps{
+		newApp: func(cliapp.Deps) appRunner {
+			called = true
+			return fakeApp{run: func(context.Context, []string) int { return 99 }}
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("runWithDeps([--json --config /tmp/looper.json --version]) exit code = %d, want 0", exitCode)
+	}
+	if called {
+		t.Fatal("newApp was called for --version after global flags")
+	}
+	if got, want := stdout.String(), version.Value+"\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty string", got)
+	}
+}
+
+func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	exitCode := runWithDeps([]string{"version"}, stdout, stderr, runDeps{
+		newApp: func(deps cliapp.Deps) appRunner {
+			deps.HomeDir = t.TempDir()
+			deps.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, os.ErrNotExist
+			})}
+			return cliapp.New(deps)
+		},
+	})
 
 	if exitCode != 0 {
 		t.Fatalf("run([version]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
@@ -163,7 +235,7 @@ func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
 	if got := stderr.String(); got != "" {
 		t.Fatalf("run([version]) stderr = %q, want empty string", got)
 	}
-	if got, want := stdout.String(), version.Value+"\n"; got != want {
+	if got, want := stdout.String(), "CLI version: "+version.Value+"\nlooperd server version: unavailable\n"; got != want {
 		t.Fatalf("run([version]) stdout = %q, want %q", got, want)
 	}
 }
