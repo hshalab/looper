@@ -346,6 +346,15 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) fixCreate(cmd *cobra.Command, args []string) error {
+	loopFlagChanged := cmd.Flags().Changed("loop")
+	noLoop := getBoolFlag(cmd, "no-loop")
+	if loopFlagChanged && noLoop {
+		return fmt.Errorf("--loop and --no-loop are mutually exclusive")
+	}
+	loopEnabled := false
+	if !noLoop && loopFlagChanged {
+		loopEnabled = getBoolFlag(cmd, "loop")
+	}
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		projectID, repo, prNumber, err := r.resolveReviewTarget(ctx, strings.TrimSpace(args[0]), strings.TrimSpace(getStringFlag(cmd, "project")))
 		if err != nil {
@@ -359,6 +368,10 @@ func (r *commandRuntime) fixCreate(cmd *cobra.Command, args []string) error {
 			"repo":       repo,
 			"prNumber":   prNumber,
 			"status":     "running",
+			"metadata": map[string]any{
+				"manual":        true,
+				"followUpdates": loopEnabled,
+			},
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops", body)

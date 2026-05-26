@@ -1101,24 +1101,33 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
 	policy := r.discoveryPolicyForProject(project.ID)
-	if !policy.AutoDiscovery {
-		return DiscoveryResult{Skipped: 1}, nil
-	}
 	currentUser := ""
-	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
-	recoveredQueueItems, err := r.recoverLegacyNoopFollowupLoops(ctx, *project, input.Repo, policy, currentUser)
+	recoveredQueueItems := []storage.QueueItemRecord{}
+	openPRs := []PullRequestSummary{}
+	loopsByPR, manualFollowupPRNumbers, err := r.listFixerLoopsByPR(ctx, input.ProjectID, input.Repo)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, currentUser, policy, "")
-	if err != nil {
-		return DiscoveryResult{}, err
+	if policy.AutoDiscovery {
+		recoveredQueueItems, err = r.recoverLegacyNoopFollowupLoops(ctx, *project, input.Repo, policy, currentUser)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		openPRs, err = r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, currentUser, policy, "")
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+	}
+	openPRs = appendManualFixerFollowupCandidates(openPRs, manualFollowupPRNumbers)
+	if !policy.AutoDiscovery && len(openPRs) == 0 {
+		return DiscoveryResult{Skipped: 1}, nil
 	}
 	result := DiscoveryResult{}
 	for _, item := range recoveredQueueItems {
@@ -1126,13 +1135,17 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range openPRs {
 
-		if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy) {
+		if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy, loopsByPR) {
 			result.Skipped++
 			continue
 		}
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
 		if err != nil {
 			return DiscoveryResult{}, err
+		}
+		if normalizePRState(detail.State) != "open" {
+			result.Skipped++
+			continue
 		}
 		if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
 			return DiscoveryResult{}, err
@@ -1157,11 +1170,18 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
 	policy := r.discoveryPolicyForProject(project.ID)
+	loopsByPR, _, err := r.listFixerLoopsByPR(ctx, input.ProjectID, input.Repo)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	if !policy.AutoDiscovery {
-		return DiscoveryResult{Skipped: 1}, nil
+		manualFollowupLoop := manualFixerFollowupLoopFromCandidates(loopsByPR[input.PRNumber])
+		if manualFollowupLoop == nil {
+			return DiscoveryResult{Skipped: 1}, nil
+		}
 	}
 	currentUser := ""
-	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
@@ -1172,9 +1192,12 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	if normalizePRState(detail.State) != "open" {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
 	pr := PullRequestSummary{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, Author: detail.Author}
 	result := DiscoveryResult{}
-	if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy) {
+	if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy, loopsByPR) {
 		if !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 			if err := r.pauseFixerLoopForLabelMismatch(ctx, project.ID, input.Repo, input.PRNumber); err != nil {
 				return DiscoveryResult{}, err
@@ -1206,30 +1229,42 @@ func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, in
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
 	policy := r.discoveryPolicyForProject(project.ID)
-	if !policy.AutoDiscovery {
-		return DiscoveryResult{Skipped: 1}, nil
-	}
 	currentUser := ""
-	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
-	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, 0, currentUser, policy, baseRefName)
+	openPRs := []PullRequestSummary{}
+	loopsByPR, manualFollowupPRNumbers, err := r.listFixerLoopsByPR(ctx, input.ProjectID, input.Repo)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	if policy.AutoDiscovery {
+		openPRs, err = r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, 0, currentUser, policy, baseRefName)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+	}
+	openPRs = appendManualFixerFollowupCandidates(openPRs, manualFollowupPRNumbers)
+	if !policy.AutoDiscovery && len(openPRs) == 0 {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
 	result := DiscoveryResult{}
 	for _, pr := range openPRs {
-		if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy) {
+		if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy, loopsByPR) {
 			result.Skipped++
 			continue
 		}
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
 		if err != nil {
 			return DiscoveryResult{}, err
+		}
+		if normalizePRState(detail.State) != "open" || !strings.EqualFold(strings.TrimSpace(detail.BaseRefName), baseRefName) {
+			result.Skipped++
+			continue
 		}
 		if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
 			return DiscoveryResult{}, err
@@ -1304,19 +1339,40 @@ func defaultDiscoveryLimit(limit int) int {
 	return limit
 }
 
-func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID string, pr PullRequestSummary, repo, currentUser string, policy DiscoveryPolicy) bool {
-	if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" {
+func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID string, pr PullRequestSummary, repo, currentUser string, policy DiscoveryPolicy, loopsByPR map[int64][]storage.LoopRecord) bool {
+	candidates := []storage.LoopRecord(nil)
+	if loopsByPR != nil {
+		candidates = loopsByPR[pr.Number]
+	}
+	manualFollowupLoop := manualFixerFollowupLoopFromCandidates(candidates)
+	if manualFollowupLoop == nil && loopsByPR == nil {
+		manualFollowupLoop, _ = r.findManualFixerFollowupLoopByPR(ctx, projectID, repo, pr.Number)
+	}
+	if normalizePRState(pr.State) != "open" {
+		return false
+	}
+	if manualFollowupLoop == nil && !policy.IncludeDrafts && pr.IsDraft {
 		return false
 	}
 	if r.hasActivePRLock(ctx, repo, pr.Number) {
-		loop, err := r.findFixerLoopByPR(ctx, projectID, repo, pr.Number)
+		var (
+			loop *storage.LoopRecord
+			err  error
+		)
+		if loopsByPR != nil {
+			loop, err = r.runningFixerLoopFromCandidates(ctx, candidates)
+		} else {
+			loop, err = r.findRunningFixerLoopByPR(ctx, projectID, repo, pr.Number, nil)
+		}
 		if err != nil || loop == nil {
 			return false
 		}
-		activeRun, err := r.latestActiveRunningRun(ctx, loop.ID)
-		if err != nil || activeRun == nil {
+		if isManualFixerLoop(*loop) && !fixerFollowUpdatesEnabled(*loop) {
 			return false
 		}
+	}
+	if manualFollowupLoop != nil {
+		return true
 	}
 	if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
 		return false
@@ -1328,6 +1384,14 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 }
 
 func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, result *DiscoveryResult) error {
+	loop, err := r.findFixerLoopByPR(ctx, project.ID, repo, detail.Number)
+	if err != nil {
+		return err
+	}
+	if loop != nil && isManualFixerLoop(*loop) && !fixerFollowUpdatesEnabled(*loop) {
+		result.Skipped++
+		return nil
+	}
 	allFixItems := collectFixItems(detail)
 	if len(allFixItems) == 0 {
 		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {
@@ -1605,7 +1669,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, fmt.Errorf("run not found after start checkpoint: %s", resumedRun.Run.ID)
 	}
 	run = *persistedRun
-	if reason, err := r.pullRequestOwnershipSkipReason(ctx, project.ID, project.RepoPath, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+	if reason, err := r.pullRequestOwnershipSkipReason(ctx, *loop, project.ID, project.RepoPath, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if reason != "" {
 		checkpoint.SkipReason = reason
@@ -1632,7 +1696,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
-	if reason, err := r.pullRequestLabelAuthoritySkipReason(ctx, project.ID, project.RepoPath, queueItem, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+	if reason, err := r.pullRequestLabelAuthoritySkipReason(ctx, *loop, project.ID, project.RepoPath, queueItem, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if reason != "" {
 		checkpoint.SkipReason = reason
@@ -1812,6 +1876,12 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if current == nil {
 		return false, nil
 	}
+	if !fixerFollowUpdatesEnabled(*current) {
+		if _, err := r.clearPendingFixerRediscovery(ctx, *current); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
 	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(current.MetadataJSON))
 	if !ok {
 		return false, nil
@@ -1859,6 +1929,9 @@ func (r *Runner) scheduleFollowupRetryAfterSuccess(ctx context.Context, loop sto
 		return false, err
 	}
 	if current == nil {
+		return false, nil
+	}
+	if !fixerFollowUpdatesEnabled(*current) {
 		return false, nil
 	}
 	followup, ok := parseFixerFollowupState(parseJSONObject(current.MetadataJSON))
@@ -1923,7 +1996,16 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 	return checkpoint, nil
 }
 
-func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, projectID, cwd, repo string, prNumber int64) (string, error) {
+func isManualFixerLoop(loop storage.LoopRecord) bool {
+	meta := parseJSONObject(loop.MetadataJSON)
+	manual, _ := meta["manual"].(bool)
+	return manual
+}
+
+func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, loop storage.LoopRecord, projectID, cwd, repo string, prNumber int64) (string, error) {
+	if isManualFixerLoop(loop) {
+		return "", nil
+	}
 	if r.discoveryPolicyForProject(projectID).AuthorFilter == config.FixerAuthorFilterAny {
 		return "", nil
 	}
@@ -1941,7 +2023,10 @@ func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, projectID, 
 	return fmt.Sprintf("Skipped fixer run for %s#%d because PR author %q does not match fixer owner %q", repo, prNumber, strings.TrimSpace(author), strings.TrimSpace(currentUser)), nil
 }
 
-func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, projectID, cwd string, queueItem storage.QueueItemRecord, repo string, prNumber int64) (string, error) {
+func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, loop storage.LoopRecord, projectID, cwd string, queueItem storage.QueueItemRecord, repo string, prNumber int64) (string, error) {
+	if isManualFixerLoop(loop) {
+		return "", nil
+	}
 	policy := r.discoveryPolicyForProject(projectID)
 	if !queueItemRequiresLabelAuthority(queueItem) {
 		return "", nil
@@ -3694,71 +3779,81 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
+	matchingLoops := make([]storage.LoopRecord, 0)
 	for _, existing := range existingLoops {
 		if existing.Type == "fixer" && existing.ProjectID == project.ID && derefString(existing.Repo) == repo && derefInt64(existing.PRNumber) == prNumber {
-			if existing.Status == "paused" {
-				if resumed, updated, err := r.resumePausedZeroProgressLoop(ctx, existing, headSHA, fixItemsStateHash); err != nil {
-					return loopUpsertResult{}, err
-				} else if resumed {
-					existing = updated
-				} else if resumed, updated, err := r.resumePausedLabelMismatchLoop(ctx, existing); err != nil {
-					return loopUpsertResult{}, err
-				} else if resumed {
-					existing = updated
-				} else if resumed, updated, err := r.resumePausedNoopResolveLoop(ctx, existing, headSHA, fixItemsStateHash, unresolvedThreadIDs); err != nil {
-					return loopUpsertResult{}, err
-				} else if resumed {
-					existing = updated
-				} else if resumed, updated, err := r.resumePausedRiskyConflictLoop(ctx, existing, headSHA, fixItemsStateHash); err != nil {
-					return loopUpsertResult{}, err
-				} else if !resumed {
-					return loopUpsertResult{record: existing, created: false}, nil
-				} else {
-					existing = updated
-				}
+			if isManualFixerLoop(existing) && !isManualFixerFollowupCandidate(existing) {
+				continue
 			}
-			if loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), buildFixerDiscoveryFingerprint(repo, prNumber, headSHA, fixItemsStateHash)) {
-				return loopUpsertResult{record: existing, created: false, skipped: true}, nil
+			matchingLoops = append(matchingLoops, existing)
+		}
+	}
+	existing, err := r.preferredFixerLoopCandidate(ctx, matchingLoops)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	if existing != nil {
+		updatedLoop := *existing
+		if updatedLoop.Status == "paused" {
+			if resumed, updated, err := r.resumePausedZeroProgressLoop(ctx, updatedLoop, headSHA, fixItemsStateHash); err != nil {
+				return loopUpsertResult{}, err
+			} else if resumed {
+				updatedLoop = updated
+			} else if resumed, updated, err := r.resumePausedLabelMismatchLoop(ctx, updatedLoop); err != nil {
+				return loopUpsertResult{}, err
+			} else if resumed {
+				updatedLoop = updated
+			} else if resumed, updated, err := r.resumePausedNoopResolveLoop(ctx, updatedLoop, headSHA, fixItemsStateHash, unresolvedThreadIDs); err != nil {
+				return loopUpsertResult{}, err
+			} else if resumed {
+				updatedLoop = updated
+			} else if resumed, updated, err := r.resumePausedRiskyConflictLoop(ctx, updatedLoop, headSHA, fixItemsStateHash); err != nil {
+				return loopUpsertResult{}, err
+			} else if !resumed {
+				return loopUpsertResult{record: updatedLoop, created: false}, nil
+			} else {
+				updatedLoop = updated
 			}
-			decision := decideRediscoveryAfterNoopResolve(existing, headSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs, now)
-			if decision.Action == rediscoveryActionSuppress {
-				return loopUpsertResult{record: existing, created: false, skipped: true}, nil
+		}
+		if loops.ShouldSuppressFailedRediscovery(updatedLoop.Status, loops.LastFailedDiscoveryFingerprint(updatedLoop.MetadataJSON), buildFixerDiscoveryFingerprint(repo, prNumber, headSHA, fixItemsStateHash)) {
+			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
+		}
+		decision := decideRediscoveryAfterNoopResolve(updatedLoop, headSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs, now)
+		if decision.Action == rediscoveryActionSuppress {
+			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
+		}
+		availableAt := now
+		if decision.Action == rediscoveryActionDefer {
+			availableAt = parseRFC3339OrZero(decision.NextEligibleAt)
+			if availableAt.IsZero() {
+				availableAt = now
 			}
-			availableAt := now
-			if decision.Action == rediscoveryActionDefer {
-				availableAt = parseRFC3339OrZero(decision.NextEligibleAt)
-				if availableAt.IsZero() {
-					availableAt = now
-				}
-			}
-			availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
-			updated := existing
-			activeRun, err := r.latestActiveRunningRun(ctx, updated.ID)
+		}
+		availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
+		activeRun, err := r.latestActiveRunningRun(ctx, updatedLoop.ID)
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
+		if activeRun != nil {
+			updatedLoop.Status = "running"
+			updatedLoop.NextRunAt = nil
+			updatedLoop, err = r.recordPendingFixerRediscovery(ctx, updatedLoop, headSHA, fixItemsStateHash, unresolvedThreadIDs)
 			if err != nil {
 				return loopUpsertResult{}, err
 			}
-			if activeRun != nil {
-				updated.Status = "running"
-				updated.NextRunAt = nil
-				updated, err = r.recordPendingFixerRediscovery(ctx, updated, headSHA, fixItemsStateHash, unresolvedThreadIDs)
-				if err != nil {
-					return loopUpsertResult{}, err
-				}
-				updated.UpdatedAt = nowISO
-				if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
-					return loopUpsertResult{}, err
-				}
-				return loopUpsertResult{record: updated, created: false, pending: true}, nil
-			} else {
-				updated.Status = "queued"
-				updated.NextRunAt = &availableAtISO
-			}
-			updated.UpdatedAt = nowISO
-			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+			updatedLoop.UpdatedAt = nowISO
+			if err := r.repos.Loops.Upsert(ctx, updatedLoop); err != nil {
 				return loopUpsertResult{}, err
 			}
-			return loopUpsertResult{record: updated, created: false, availableAt: availableAt}, nil
+			return loopUpsertResult{record: updatedLoop, created: false, pending: true}, nil
 		}
+		updatedLoop.Status = "queued"
+		updatedLoop.NextRunAt = &availableAtISO
+		updatedLoop.UpdatedAt = nowISO
+		if err := r.repos.Loops.Upsert(ctx, updatedLoop); err != nil {
+			return loopUpsertResult{}, err
+		}
+		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt}, nil
 	}
 	seq, err := r.repos.Loops.AllocateSeq(ctx)
 	if err != nil {
@@ -3918,10 +4013,17 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 		if loop.Status == "paused" || loop.Status == "running" {
 			continue
 		}
+		if isManualFixerLoop(loop) && !isManualFixerFollowupCandidate(loop) {
+			continue
+		}
 		if r.hasActivePRLock(ctx, repo, *loop.PRNumber) {
 			continue
 		}
 		metadata := parseJSONObject(loop.MetadataJSON)
+		if isManualFixerLoop(loop) && !fixerFollowUpdatesEnabled(loop) {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
 		if _, ok := parseFixerFollowupState(metadata); ok {
 			continue
 		}
@@ -3954,15 +4056,15 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 			}
 			continue
 		}
-		if (!policy.IncludeDrafts && detail.IsDraft) || normalizePRState(detail.State) != "open" {
+		if (!isManualFixerLoop(loop) && !policy.IncludeDrafts && detail.IsDraft) || normalizePRState(detail.State) != "open" {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
-		if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(detail.Author, currentUser) {
+		if !isManualFixerLoop(loop) && policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(detail.Author, currentUser) {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
-		if !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		if !isManualFixerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
@@ -4198,13 +4300,160 @@ func (r *Runner) findFixerLoopByPR(ctx context.Context, projectID, repo string, 
 	if err != nil {
 		return nil, err
 	}
+	matchingLoops := make([]storage.LoopRecord, 0)
 	for _, loop := range loops {
 		if loop.Type == "fixer" && loop.ProjectID == projectID && derefString(loop.Repo) == repo && derefInt64(loop.PRNumber) == prNumber {
+			matchingLoops = append(matchingLoops, loop)
+		}
+	}
+	return r.preferredFixerLoopCandidate(ctx, matchingLoops)
+}
+
+func (r *Runner) findManualFixerFollowupLoopByPR(ctx context.Context, projectID, repo string, prNumber int64) (*storage.LoopRecord, error) {
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, loop := range loops {
+		if loop.Type != "fixer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		if isManualFixerFollowupCandidate(loop) {
 			matched := loop
 			return &matched, nil
 		}
 	}
 	return nil, nil
+}
+
+func appendManualFixerFollowupCandidates(prs []PullRequestSummary, manualFollowupPRNumbers []int64) []PullRequestSummary {
+	seen := make(map[int64]struct{}, len(prs))
+	for _, pr := range prs {
+		seen[pr.Number] = struct{}{}
+	}
+	for _, prNumber := range manualFollowupPRNumbers {
+		if _, ok := seen[prNumber]; ok {
+			continue
+		}
+		prs = append(prs, PullRequestSummary{Number: prNumber, State: "OPEN"})
+		seen[prNumber] = struct{}{}
+	}
+	return prs
+}
+
+func (r *Runner) listFixerLoopsByPR(ctx context.Context, projectID, repo string) (map[int64][]storage.LoopRecord, []int64, error) {
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	loopsByPR := make(map[int64][]storage.LoopRecord)
+	manualFollowupPRNumbers := make([]int64, 0)
+	manualSeen := make(map[int64]struct{})
+	for _, loop := range loops {
+		if loop.Type != "fixer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil {
+			continue
+		}
+		prNumber := *loop.PRNumber
+		loopsByPR[prNumber] = append(loopsByPR[prNumber], loop)
+		if isManualFixerFollowupCandidate(loop) {
+			if _, ok := manualSeen[prNumber]; !ok {
+				manualFollowupPRNumbers = append(manualFollowupPRNumbers, prNumber)
+				manualSeen[prNumber] = struct{}{}
+			}
+		}
+	}
+	return loopsByPR, manualFollowupPRNumbers, nil
+}
+
+func manualFixerFollowupLoopFromCandidates(loops []storage.LoopRecord) *storage.LoopRecord {
+	for _, loop := range loops {
+		if isManualFixerFollowupCandidate(loop) {
+			matched := loop
+			return &matched
+		}
+	}
+	return nil
+}
+
+func (r *Runner) findRunningFixerLoopByPR(ctx context.Context, projectID, repo string, prNumber int64, candidates []storage.LoopRecord) (*storage.LoopRecord, error) {
+	loops := candidates
+	if len(loops) == 0 {
+		var err error
+		loops, err = r.repos.Loops.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		filtered := make([]storage.LoopRecord, 0, len(loops))
+		for _, loop := range loops {
+			if loop.Type == "fixer" && loop.ProjectID == projectID && derefString(loop.Repo) == repo && derefInt64(loop.PRNumber) == prNumber {
+				filtered = append(filtered, loop)
+			}
+		}
+		loops = filtered
+	}
+	return r.runningFixerLoopFromCandidates(ctx, loops)
+}
+
+func (r *Runner) runningFixerLoopFromCandidates(ctx context.Context, candidates []storage.LoopRecord) (*storage.LoopRecord, error) {
+	for _, loop := range candidates {
+		activeRun, err := r.latestActiveRunningRun(ctx, loop.ID)
+		if err != nil {
+			return nil, err
+		}
+		if activeRun != nil {
+			matched := loop
+			return &matched, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *Runner) preferredFixerLoopCandidate(ctx context.Context, candidates []storage.LoopRecord) (*storage.LoopRecord, error) {
+	var firstMatch *storage.LoopRecord
+	var firstAutomatic *storage.LoopRecord
+	var manualFollowup *storage.LoopRecord
+	for _, candidate := range candidates {
+		matched := candidate
+		activeRun, err := r.latestActiveRunningRun(ctx, matched.ID)
+		if err != nil {
+			return nil, err
+		}
+		if activeRun != nil && !isManualFixerLoop(matched) {
+			return &matched, nil
+		}
+		if manualFollowup == nil && isManualFixerFollowupCandidate(matched) {
+			manualFollowup = &matched
+		}
+		if firstAutomatic == nil && !isManualFixerLoop(matched) {
+			firstAutomatic = &matched
+		}
+		if firstMatch == nil && (!isManualFixerLoop(matched) || isManualFixerFollowupCandidate(matched)) {
+			firstMatch = &matched
+		}
+	}
+	if manualFollowup != nil {
+		return manualFollowup, nil
+	}
+	if firstAutomatic != nil {
+		return firstAutomatic, nil
+	}
+	return firstMatch, nil
+}
+
+func fixerFollowUpdatesEnabled(loop storage.LoopRecord) bool {
+	meta := parseJSONObject(loop.MetadataJSON)
+	if enabled, ok := meta["followUpdates"].(bool); ok {
+		return enabled
+	}
+	return !isManualFixerLoop(loop)
+}
+
+func isManualFixerFollowupCandidate(loop storage.LoopRecord) bool {
+	if !isManualFixerLoop(loop) || !fixerFollowUpdatesEnabled(loop) {
+		return false
+	}
+	status := strings.TrimSpace(loop.Status)
+	return status != "stopped" && status != "terminated"
 }
 
 func loopMetadataForPR(ctx context.Context, runner *Runner, projectID, repo string, prNumber int64) *string {
