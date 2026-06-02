@@ -2615,7 +2615,8 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		}
 	}
 
-	activeAgentByRunID := buildVerifiedActiveAgentByRunID(ctx, h.context.Runtime, activeExecutions)
+	verifiedActiveAgentByRunID := buildVerifiedActiveAgentByRunID(ctx, h.context.Runtime, activeExecutions)
+	activeAgentByRunID := buildActiveAgentByRunID(activeExecutions)
 	plausiblyLiveRunningLoopIDs := make(map[string]struct{}, len(activeRuns))
 	runningViews := make([]activeRunView, 0, len(activeRuns))
 	for _, run := range activeRuns {
@@ -2627,7 +2628,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		if err != nil {
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
-		hasActiveAgent := activeAgentByRunID[run.ID] != nil
+		hasActiveAgent := verifiedActiveAgentByRunID[run.ID] != nil
 		if !isPlausiblyLiveActiveRun(run, loop, latestRun, hasActiveAgent, h.now().UTC()) {
 			continue
 		}
@@ -2651,7 +2652,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			CurrentStep: run.CurrentStep,
 			StartedAt:   stringPtrOrNil(run.StartedAt),
 			Target:      target,
-			Agent:       activeAgentByRunID[run.ID],
+			Agent:       preferredActiveRunAgent(verifiedActiveAgentByRunID[run.ID], activeAgentByRunID[run.ID]),
 			Worktree:    buildWorktreeSummary(loop, run),
 		}
 		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRun)
@@ -2889,22 +2890,38 @@ func buildVerifiedActiveAgentByRunID(ctx context.Context, runtime RuntimeState, 
 	if verifier == nil {
 		return map[string]*activeRunAgent{}
 	}
+	grouped := groupActiveExecutionsByRunID(executions, true, func(execution storage.AgentExecutionRecord) bool {
+		matches, running, err := verifier.ExecutionMatchesProcess(ctx, execution, int(*execution.PID))
+		return err == nil && running && matches
+	})
+	return buildActiveRunAgents(grouped)
+}
+
+func buildActiveAgentByRunID(executions []storage.AgentExecutionRecord) map[string]*activeRunAgent {
+	return buildActiveRunAgents(groupActiveExecutionsByRunID(executions, false, func(storage.AgentExecutionRecord) bool {
+		return true
+	}))
+}
+
+func groupActiveExecutionsByRunID(executions []storage.AgentExecutionRecord, requirePID bool, include func(storage.AgentExecutionRecord) bool) map[string][]storage.AgentExecutionRecord {
 	grouped := make(map[string][]storage.AgentExecutionRecord)
 	for _, execution := range executions {
 		if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" {
 			continue
 		}
-		if execution.PID == nil || *execution.PID <= 0 {
+		if requirePID && (execution.PID == nil || *execution.PID <= 0) {
 			continue
 		}
-		matches, running, err := verifier.ExecutionMatchesProcess(ctx, execution, int(*execution.PID))
-		if err != nil || !running || !matches {
+		if !include(execution) {
 			continue
 		}
 		runID := *execution.RunID
 		grouped[runID] = append(grouped[runID], execution)
 	}
+	return grouped
+}
 
+func buildActiveRunAgents(grouped map[string][]storage.AgentExecutionRecord) map[string]*activeRunAgent {
 	result := make(map[string]*activeRunAgent, len(grouped))
 	for runID, bucket := range grouped {
 		sort.Slice(bucket, func(i, j int) bool {
@@ -2928,6 +2945,13 @@ func buildVerifiedActiveAgentByRunID(ctx context.Context, runtime RuntimeState, 
 	}
 
 	return result
+}
+
+func preferredActiveRunAgent(verified *activeRunAgent, fallback *activeRunAgent) *activeRunAgent {
+	if verified != nil {
+		return verified
+	}
+	return fallback
 }
 
 func isPlausiblyLiveActiveRun(run storage.RunRecord, loop storage.LoopRecord, latestRun *storage.RunRecord, hasActiveAgent bool, now time.Time) bool {
