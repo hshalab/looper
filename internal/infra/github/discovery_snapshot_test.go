@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/infra/shell"
 )
@@ -153,5 +154,128 @@ func TestDiscoverySnapshotDoesNotCacheFailedPullRequestDetailFetch(t *testing.T)
 	}
 	if viewCalls != 2 {
 		t.Fatalf("pr view calls = %d, want 2 after retry", viewCalls)
+	}
+}
+
+func TestDiscoverySnapshotUsesGatewayDiscoveryTTLCacheAcrossTicks(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 6, 3, 10, 0, 0, 0, time.UTC)
+	prListCalls := 0
+	gateway := New(Options{
+		Now:               func() time.Time { return now },
+		DiscoveryCacheTTL: 30 * time.Second,
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			cmd := strings.Join(options.Args, " ")
+			if strings.Contains(cmd, "pr list") {
+				prListCalls++
+				return shell.Result{Stdout: `[
+					{"number":1,"title":"PR 1","state":"OPEN","labels":[{"name":"bug"}],"baseRefName":"main","headRefOid":"sha-1","author":{"login":"octo"},"reviews":[{"state":"APPROVED","author":{"login":"reviewer"},"commit":{"oid":"sha-1"},"comments":[{"body":"ok"}]}]}
+				]`}, nil
+			}
+			return shell.Result{}, errors.New("unexpected command: " + cmd)
+		},
+	})
+
+	firstCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
+	first, err := gateway.ListOpenPullRequests(firstCtx, ListOpenPullRequestsInput{Repo: "acme/looper", CWD: "/repo", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests(first) error = %v", err)
+	}
+	first[0].Labels[0] = "mutated"
+	firstReviewAuthor, ok := first[0].Reviews[0]["author"].(map[string]any)
+	if !ok {
+		t.Fatalf("review author = %#v, want object", first[0].Reviews[0]["author"])
+	}
+	firstReviewAuthor["login"] = "mutated"
+	firstReviewCommit, ok := first[0].Reviews[0]["commit"].(map[string]any)
+	if !ok {
+		t.Fatalf("review commit = %#v, want object", first[0].Reviews[0]["commit"])
+	}
+	firstReviewCommit["oid"] = "mutated"
+	firstReviewComments, ok := first[0].Reviews[0]["comments"].([]any)
+	if !ok {
+		t.Fatalf("review comments = %#v, want array", first[0].Reviews[0]["comments"])
+	}
+	firstReviewComment, ok := firstReviewComments[0].(map[string]any)
+	if !ok {
+		t.Fatalf("review comment = %#v, want object", firstReviewComments[0])
+	}
+	firstReviewComment["body"] = "mutated"
+
+	now = now.Add(10 * time.Second)
+	secondCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
+	second, err := gateway.ListOpenPullRequests(secondCtx, ListOpenPullRequestsInput{Repo: "acme/looper", CWD: "/repo", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests(second) error = %v", err)
+	}
+	if prListCalls != 1 {
+		t.Fatalf("pr list calls after ttl hit = %d, want 1", prListCalls)
+	}
+	if got := second[0].Labels[0]; got != "bug" {
+		t.Fatalf("cached label = %q, want cache to be isolated from caller mutation", got)
+	}
+	secondReviewAuthor, ok := second[0].Reviews[0]["author"].(map[string]any)
+	if !ok {
+		t.Fatalf("cached review author = %#v, want object", second[0].Reviews[0]["author"])
+	}
+	if got := secondReviewAuthor["login"]; got != "reviewer" {
+		t.Fatalf("cached review author login = %q, want cache to be isolated from caller mutation", got)
+	}
+	secondReviewCommit, ok := second[0].Reviews[0]["commit"].(map[string]any)
+	if !ok {
+		t.Fatalf("cached review commit = %#v, want object", second[0].Reviews[0]["commit"])
+	}
+	if got := secondReviewCommit["oid"]; got != "sha-1" {
+		t.Fatalf("cached review commit oid = %q, want cache to be isolated from caller mutation", got)
+	}
+	secondReviewComments, ok := second[0].Reviews[0]["comments"].([]any)
+	if !ok {
+		t.Fatalf("cached review comments = %#v, want array", second[0].Reviews[0]["comments"])
+	}
+	secondReviewComment, ok := secondReviewComments[0].(map[string]any)
+	if !ok {
+		t.Fatalf("cached review comment = %#v, want object", secondReviewComments[0])
+	}
+	if got := secondReviewComment["body"]; got != "ok" {
+		t.Fatalf("cached review comment body = %q, want cache to be isolated from caller mutation", got)
+	}
+
+	now = now.Add(31 * time.Second)
+	thirdCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
+	if _, err := gateway.ListOpenPullRequests(thirdCtx, ListOpenPullRequestsInput{Repo: "acme/looper", CWD: "/repo", Limit: 10}); err != nil {
+		t.Fatalf("ListOpenPullRequests(third) error = %v", err)
+	}
+	if prListCalls != 2 {
+		t.Fatalf("pr list calls after ttl expiry = %d, want 2", prListCalls)
+	}
+}
+
+func TestDiscoverySnapshotDiscoveryCacheTTLZeroDisablesGatewayCache(t *testing.T) {
+	t.Parallel()
+
+	prListCalls := 0
+	gateway := New(Options{
+		DiscoveryCacheTTL: 0,
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			cmd := strings.Join(options.Args, " ")
+			if strings.Contains(cmd, "pr list") {
+				prListCalls++
+				return shell.Result{Stdout: `[
+					{"number":1,"title":"PR 1","state":"OPEN","labels":[],"baseRefName":"main","headRefOid":"sha-1","author":{"login":"octo"}}
+				]`}, nil
+			}
+			return shell.Result{}, errors.New("unexpected command: " + cmd)
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		ctx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
+		if _, err := gateway.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: "acme/looper", CWD: "/repo", Limit: 10}); err != nil {
+			t.Fatalf("ListOpenPullRequests(%d) error = %v", i, err)
+		}
+	}
+	if prListCalls != 2 {
+		t.Fatalf("pr list calls with ttl disabled = %d, want 2", prListCalls)
 	}
 }
