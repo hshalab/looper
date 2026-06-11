@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var ErrQueueItemNotActive = errors.New("queue item not active")
+
 type sqliteQuerier interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -479,15 +481,15 @@ func (r *ProjectsRepository) List(ctx context.Context) ([]ProjectRecord, error) 
 	return scanProjects(rows)
 }
 
-func (r *ProjectsRepository) Delete(ctx context.Context, id string) (bool, error) {
-	result, err := r.q.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, id)
+func (r *ProjectsRepository) Archive(ctx context.Context, id string, updatedAt string) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `UPDATE projects SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0`, updatedAt, id)
 	if err != nil {
-		return false, fmt.Errorf("delete project: %w", err)
+		return false, fmt.Errorf("archive project: %w", err)
 	}
 
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("delete project rows affected: %w", err)
+		return false, fmt.Errorf("archive project rows affected: %w", err)
 	}
 
 	return rowsAffected > 0, nil
@@ -671,6 +673,30 @@ func (r *LoopsRepository) CountByTypeAndStatus(ctx context.Context) (map[string]
 	}
 
 	return counts, nil
+}
+
+func (r *LoopsRepository) TerminateByProject(ctx context.Context, projectID, updatedAt string) (int64, error) {
+	if strings.TrimSpace(projectID) == "" {
+		return 0, nil
+	}
+
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE loops
+		SET status = 'terminated',
+			next_run_at = NULL,
+			updated_at = ?
+		WHERE project_id = ? AND status IN ('idle', 'queued', 'running', 'paused', 'waiting', 'failed', 'interrupted')
+	`, updatedAt, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("terminate loops by project: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read terminate loops by project rows affected: %w", err)
+	}
+
+	return affected, nil
 }
 
 type RunsRepository struct{ q sqliteQuerier }
@@ -1913,13 +1939,20 @@ func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy
 }
 
 func (r *QueueRepository) Complete(ctx context.Context, id, finishedAt string) error {
-	_, err := r.q.ExecContext(ctx, `
+	result, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = 'completed', finished_at = ?, updated_at = ?
-		WHERE id = ?
+		WHERE id = ? AND status IN ('queued', 'running')
 	`, finishedAt, finishedAt, id)
 	if err != nil {
 		return fmt.Errorf("complete queue item: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read complete queue item rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("complete queue item: %w", ErrQueueItemNotActive)
 	}
 
 	return nil
@@ -1951,6 +1984,11 @@ func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInp
 			finished_at = NULL,
 			updated_at = ?
 		WHERE id = ?
+			AND NOT EXISTS (
+				SELECT 1
+				FROM projects p
+				WHERE p.id = queue_items.project_id AND p.archived = 1
+			)
 	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
 		return fmt.Errorf("mark queue item for retry: %w", err)
@@ -1968,7 +2006,7 @@ func (r *QueueRepository) Fail(ctx context.Context, input QueueFailInput) error 
 			last_error = ?,
 			last_error_kind = ?,
 			updated_at = ?
-		WHERE id = ?
+		WHERE id = ? AND status IN ('queued', 'running')
 	`, "manual_intervention", input.Attempts, input.Attempts, input.FinishedAt, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
 		return fmt.Errorf("fail queue item: %w", err)
@@ -2204,6 +2242,31 @@ func (r *QueueRepository) CancelByLoop(ctx context.Context, loopID, finishedAt s
 	return affected, nil
 }
 
+func (r *QueueRepository) CancelByProject(ctx context.Context, projectID, finishedAt string, reason *string) (int64, error) {
+	if strings.TrimSpace(projectID) == "" {
+		return 0, nil
+	}
+
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'cancelled',
+			finished_at = ?,
+			last_error = COALESCE(?, last_error),
+			updated_at = ?
+		WHERE project_id = ? AND status IN ('queued', 'running', 'failed', 'manual_intervention')
+	`, finishedAt, reason, finishedAt, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("cancel queue items by project: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read cancel queue items by project rows affected: %w", err)
+	}
+
+	return affected, nil
+}
+
 func (r *QueueRepository) CancelActiveByLoopExcept(ctx context.Context, loopID, keepID, finishedAt string, reason *string) (int64, error) {
 	if strings.TrimSpace(loopID) == "" || strings.TrimSpace(keepID) == "" {
 		return 0, nil
@@ -2384,8 +2447,10 @@ const scheduledQueueBaseQuery = `
 	SELECT qi.*
 	FROM queue_items qi
 	LEFT JOIN loops l ON l.id = qi.loop_id
+	LEFT JOIN projects p ON p.id = qi.project_id
 	WHERE qi.status = 'queued'
 		AND qi.available_at <= ?
+		AND (qi.project_id IS NULL OR p.archived = 0)
 		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
 		AND (
 			qi.lock_key IS NULL
