@@ -857,6 +857,18 @@ func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *test
 			wantWarnings: []string{`deprecated config path "projects[].roles.reviewer.autoDiscovery" is accepted for now; use "projects[].roles.reviewer.discovery.autoDiscovery" instead`},
 		},
 		{
+			name:     "retired sweeper role configs are ignored",
+			fileName: "config.json",
+			contents: `{"roles":{"sweeper":{"enabled":true,"pollInterval":"1m"}},"projects":[{"id":"demo","name":"Demo","repoPath":"/repos/demo","roles":{"sweeper":{"enabled":false}}}]}`,
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if len(loaded.Config.Projects) != 1 {
+					t.Fatalf("projects len = %d, want 1", len(loaded.Config.Projects))
+				}
+			},
+			wantWarnings: []string{},
+		},
+		{
 			name:     "legacy project path alias is preserved when it matches repoPath",
 			fileName: "config.yaml",
 			contents: "projects:\n  - id: demo\n    name: Demo\n    path: /repos/demo\n    repoPath: /repos/demo\n",
@@ -1637,104 +1649,6 @@ func TestProjectRoleConfigOverridesGlobalRoleConfig(t *testing.T) {
 	}
 }
 
-func TestSweeperRoleAutoDiscoveryAndProjectOverrideAffectRoleHelpers(t *testing.T) {
-	cwd := t.TempDir()
-	configPath := filepath.Join(cwd, "config.json")
-	contents := `{
-		"roles": {
-			"sweeper": {
-				"autoDiscovery": false,
-				"triggers": {"maxPerTick": 10, "excludeLabels": ["keep-open"]},
-				"lifecycle": {"pendingLabel": "looper:sweep-pending", "closedLabel": "looper:swept", "keepLabel": "looper:sweep-keep"},
-				"security": {"quarantineLabel": "looper:sweeper-route-security"}
-			}
-		},
-		"projects": [{
-			"id": "demo",
-			"name": "Demo",
-			"repoPath": "/repos/demo",
-			"roles": {
-				"sweeper": {"autoDiscovery": true, "triggers": {"excludeLabels": ["project:keep-open"], "maxPerTick": 12}}
-			}
-		}]
-	}`
-	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
-		t.Fatalf("os.WriteFile() error = %v", err)
-	}
-
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
-	if err != nil {
-		skipIfSweeperConfigUnsupported(t, err)
-	}
-
-	if _, ok := roleConfigMapFromRoles(t, loaded.Config.Roles, "sweeper"); !ok {
-		t.Skip("sweeper role support is not yet present in RoleConfigs")
-	}
-
-	globalRoles := ProjectRoleConfigs(loaded.Config, "missing")
-	globalSweeper := roleMapForRole(t, globalRoles, "sweeper")
-	globalAuto, ok := boolValueFromRoleMap(globalSweeper, "autoDiscovery")
-	if !ok || globalAuto {
-		t.Fatalf("global sweeper autoDiscovery = %v, want false", globalAuto)
-	}
-
-	globalExcludeLabels := labelsFromRoleMap(t, roleMapFromRoleSection(t, globalSweeper, "triggers"), "excludeLabels")
-	if !reflectStringSlicesEqual(globalExcludeLabels, []string{"keep-open"}) {
-		t.Fatalf("global sweeper excludeLabels = %#v, want %v", globalExcludeLabels, []string{"keep-open"})
-	}
-
-	projectRoles := ProjectRoleConfigs(loaded.Config, "demo")
-	projectSweeper := roleMapForRole(t, projectRoles, "sweeper")
-	projectAuto, ok := boolValueFromRoleMap(projectSweeper, "autoDiscovery")
-	if !ok || !projectAuto {
-		t.Fatalf("project sweeper autoDiscovery = %v, want true", projectAuto)
-	}
-	projectExcludeLabels := labelsFromRoleMap(t, roleMapFromRoleSection(t, projectSweeper, "triggers"), "excludeLabels")
-	if !reflectStringSlicesEqual(projectExcludeLabels, []string{"project:keep-open"}) {
-		t.Fatalf("project sweeper excludeLabels = %#v, want %v", projectExcludeLabels, []string{"project:keep-open"})
-	}
-
-	if !AnyProjectRoleAutoDiscoveryEnabled(loaded.Config, "sweeper") {
-		t.Fatal("AnyProjectRoleAutoDiscoveryEnabled(sweeper) = false, want true from project override")
-	}
-}
-
-func TestLoadFileSupportsSweeperCustomInstructions(t *testing.T) {
-	cwd := t.TempDir()
-	configPath := filepath.Join(cwd, "config.json")
-	contents := `{
-		"instructions": {"enabled": true},
-		"roles": {"sweeper": {"instructions": "Global sweeper instruction."}},
-		"projects": [{
-			"id": "demo",
-			"name": "Demo",
-			"repoPath": "/repos/demo",
-			"roles": {"sweeper": {"instructions": "Project sweeper role instruction."}},
-			"instructions": {"sweeper": "Project sweeper map instruction."}
-		}]
-	}`
-	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
-		t.Fatalf("os.WriteFile() error = %v", err)
-	}
-
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
-	if err != nil {
-		skipIfSweeperConfigUnsupported(t, err)
-	}
-
-	if _, ok := roleConfigMapFromRoles(t, loaded.Config.Roles, "sweeper"); !ok {
-		t.Skip("sweeper role support is not yet present in RoleConfigs")
-	}
-
-	block := BuildCustomInstructionBlock(loaded.Config, "demo", "sweeper")
-	if !strings.Contains(block.Text, "Project demo sweeper role instruction") {
-		t.Fatalf("custom instruction block did not include project sweeper role override: %q", block.Text)
-	}
-	if strings.Contains(block.Text, "Project demo sweeper instructions") || strings.Contains(block.Text, "Project sweeper map instruction.") {
-		t.Fatalf("custom instruction block kept deprecated project instruction map instead of canonical project role instructions: %q", block.Text)
-	}
-}
-
 func TestCoordinatorRoleProjectOverrideAffectsRoleHelpers(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -1859,71 +1773,6 @@ func TestValidateRejectsInvalidCoordinatorConfig(t *testing.T) {
 	assertValidationIssueForPathPrefix(t, validationErr.Issues, "roles.coordinator.dispatch.humanGate.allowedUsers")
 }
 
-func TestValidateRejectsInvalidSweeperTriggerThresholdAndAssociationConfig(t *testing.T) {
-	cwd := t.TempDir()
-	configPath := filepath.Join(cwd, "config.json")
-	contents := `{
-		"roles": {
-			"sweeper": {
-				"autoDiscovery": true,
-				"triggers": {
-					"includeIssues": false,
-					"includePullRequests": false,
-					"maxPerTick": 0,
-					"reopenCooldownDays": 0,
-					"excludeAuthorAssociations": ["BOGUS"],
-					"excludeLabels": ["", ""],
-					"looperInternalLabels": ["looper:spec-reviewing", "looper:sweep-pending"]
-				},
-				"lifecycle": {
-					"pendingLabel": "looper:sweep-pending",
-					"closedLabel": "looper:sweep-pending",
-					"keepLabel": "looper:sweep-keep"
-				},
-				"security": {
-					"quarantineLabel": "looper:sweep-keep"
-				},
-				"limits": {
-					"maxWarningsPerRepoPerDay": -1,
-					"maxClosesPerRepoPerDay": -1,
-					"globalKillSwitch": false
-				},
-				"categories": {
-					"stale": {"enabled": true, "inactivityDays": 0, "gracePeriodDays": 0, "minConfidence": 110}
-				}
-			}
-		},
-		"projects": [{"id": "demo", "name": "Demo", "repoPath": "/repos/demo"}]
-	}`
-	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
-		t.Fatalf("os.WriteFile() error = %v", err)
-	}
-
-	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
-	if err == nil {
-		t.Fatal("LoadFile() error = nil, want validation error")
-	}
-	var validationErr *ConfigValidationError
-	if !errors.As(err, &validationErr) {
-		t.Fatalf("LoadFile() error = %v, want *ConfigValidationError", err)
-	}
-
-	assertValidationIssueForPaths(t, validationErr.Issues, []string{
-		"roles.sweeper.triggers.maxPerTick",
-		"roles.sweeper.triggers.reopenCooldownDays",
-		"roles.sweeper.triggers.includeIssues",
-		"roles.sweeper.limits.maxWarningsPerRepoPerDay",
-		"roles.sweeper.limits.maxClosesPerRepoPerDay",
-		"roles.sweeper.categories.stale.inactivityDays",
-		"roles.sweeper.categories.stale.gracePeriodDays",
-		"roles.sweeper.categories.stale.minConfidence",
-		"roles.sweeper.lifecycle.closedLabel",
-		"roles.sweeper.security.quarantineLabel",
-	})
-	assertValidationIssueForPathPrefix(t, validationErr.Issues, "roles.sweeper.triggers.excludeLabels")
-	assertValidationIssueForPathPrefix(t, validationErr.Issues, "roles.sweeper.triggers.excludeAuthorAssociations")
-}
-
 func TestLoadFileSupportsReviewerEnableSelfReviewOverride(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -2040,6 +1889,24 @@ func TestCanonicalProjectRoleInstructionsBeatLegacyProjectInstructionMap(t *test
 	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
 }
 
+func TestLegacyProjectInstructionsIgnoreRetiredSweeperRole(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.json", `{
+		"instructions": {"enabled": true, "maxBytes": 128},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"instructions": {"sweeper": "Retired sweeper guidance."}
+		}]
+	}`, nil, nil)
+
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+	if strings.Contains(block.Text, "Retired sweeper guidance.") {
+		t.Fatalf("custom instruction block = %q, want retired sweeper instructions ignored", block.Text)
+	}
+	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
+}
+
 func TestLoadFileRejectsUnknownLegacyProjectInstructionRole(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -2058,7 +1925,7 @@ func TestLoadFileRejectsUnknownLegacyProjectInstructionRole(t *testing.T) {
 		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
 	}
 
-	assertValidationIssue(t, validationErr, "projects[0].instructions.reveiwer", "role must be one of: planner, worker, reviewer, fixer, sweeper")
+	assertValidationIssue(t, validationErr, "projects[0].instructions.reveiwer", "role must be one of: planner, worker, reviewer, fixer")
 }
 
 func TestValidateProjectReviewerLabelCanBeClearedWhenDisabled(t *testing.T) {
@@ -2832,7 +2699,11 @@ func TestLoadFileRejectsInvalidCLIPortOverride(t *testing.T) {
 }
 
 func TestLoadFileRejectsInvalidEnvPortOverride(t *testing.T) {
-	_, err := LoadFile(LoadFileOptions{LookupEnv: mapEnvLookup(map[string]string{"LOOPER_PORT": "abc"})})
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	_, err := LoadFile(LoadFileOptions{ConfigPath: configPath, LookupEnv: mapEnvLookup(map[string]string{"LOOPER_PORT": "abc"})})
 	if err == nil {
 		t.Fatal("LoadFile() error = nil, want error")
 	}
@@ -2854,7 +2725,11 @@ func TestLoadFileRejectsInvalidCLIBooleanOverride(t *testing.T) {
 }
 
 func TestLoadFileRejectsInvalidEnvBooleanOverride(t *testing.T) {
-	_, err := LoadFile(LoadFileOptions{LookupEnv: mapEnvLookup(map[string]string{"LOOPER_ALLOW_AUTO_PUSH": "tru"})})
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	_, err := LoadFile(LoadFileOptions{ConfigPath: configPath, LookupEnv: mapEnvLookup(map[string]string{"LOOPER_ALLOW_AUTO_PUSH": "tru"})})
 	if err == nil {
 		t.Fatal("LoadFile() error = nil, want error")
 	}
@@ -3752,14 +3627,6 @@ func mapEnvLookup(values map[string]string) EnvLookupFunc {
 		value, ok := values[key]
 		return value, ok
 	}
-}
-
-func skipIfSweeperConfigUnsupported(t *testing.T, err error) {
-	t.Helper()
-	if strings.Contains(err.Error(), "json: unknown field \"sweeper\"") {
-		t.Skip("sweeper role support is not yet present in config schema")
-	}
-	t.Fatalf("LoadFile() error = %v", err)
 }
 
 func fakeLookPath(values map[string]string) LookPathFunc {
