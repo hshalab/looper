@@ -2487,13 +2487,17 @@ func commandPrefixMatches(expected, actual []string) bool {
 		return false
 	}
 	for i := 1; i < len(expected)-1; i++ {
-		if expected[i] != actual[i] {
+		if !processCommandTokenMatches(expected[i], actual[i]) {
 			return false
 		}
 	}
 	actualTail := strings.Join(actual[len(expected)-1:], " ")
 	expectedTail := expected[len(expected)-1]
-	return actualTail == expectedTail
+	return processCommandTokenMatches(expectedTail, actualTail)
+}
+
+func processCommandTokenMatches(expected, actual string) bool {
+	return expected == actual
 }
 
 func splitProcessCommand(command string) []string {
